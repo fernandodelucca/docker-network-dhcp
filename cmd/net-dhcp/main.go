@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/signal"
@@ -55,6 +56,18 @@ func main() {
 	if err != nil {
 		log.WithError(err).Fatal("Failed to create plugin")
 	}
+
+	// Re-attach persistent DHCP clients to containers that survived a daemon
+	// restart. Runs in the background because the plugin starts before dockerd
+	// finishes "Loading containers" — the Docker API may not list anything for
+	// several seconds. Restore handles its own readiness wait via Ping.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := p.Restore(ctx); err != nil {
+			log.WithError(err).Error("Restore phase reported errors")
+		}
+	}()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)

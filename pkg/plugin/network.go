@@ -191,6 +191,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			return fmt.Errorf("failed to parse initial IP%v address: %w", v6str, err)
 		}
 
+		p.mu.Lock()
 		hint := p.joinHints[r.EndpointID]
 		if v6 {
 			res.Interface.AddressIPv6 = info.IP
@@ -202,6 +203,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			hint.Gateway = info.Gateway
 		}
 		p.joinHints[r.EndpointID] = hint
+		p.mu.Unlock()
 
 		return nil
 	}
@@ -272,6 +274,9 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		}(); err != nil {
 			// Be sure to clean up the veth pair if any of this fails
 			netlink.LinkDel(hostLink)
+			p.mu.Lock()
+			delete(p.joinHints, r.EndpointID)
+			p.mu.Unlock()
 			return res, err
 		}
 	} else {
@@ -326,9 +331,11 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 
 			// Store the interface index so the persistent DHCP manager can locate
 			// the interface after Docker moves it into the container namespace.
+			p.mu.Lock()
 			hint := p.joinHints[r.EndpointID]
 			hint.IfIndex = ctrLink.Attrs().Index
 			p.joinHints[r.EndpointID] = hint
+			p.mu.Unlock()
 
 			if err := initialIP(ifName, false); err != nil {
 				return err
@@ -342,9 +349,16 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			return nil
 		}(); err != nil {
 			netlink.LinkDel(newLink)
+			p.mu.Lock()
+			delete(p.joinHints, r.EndpointID)
+			p.mu.Unlock()
 			return res, err
 		}
 	}
+
+	p.mu.Lock()
+	gateway := p.joinHints[r.EndpointID].Gateway
+	p.mu.Unlock()
 
 	log.WithFields(log.Fields{
 		"network":     r.NetworkID[:12],
@@ -353,7 +367,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		"mac_address": res.Interface.MacAddress,
 		"ip":          res.Interface.Address,
 		"ipv6":        res.Interface.AddressIPv6,
-		"gateway":     fmt.Sprintf("%#v", p.joinHints[r.EndpointID].Gateway),
+		"gateway":     fmt.Sprintf("%#v", gateway),
 	}).Info("Endpoint created")
 
 	return res, nil
@@ -537,11 +551,15 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		DstPrefix: dstPrefix,
 	}
 
+	p.mu.Lock()
 	hint, ok := p.joinHints[r.EndpointID]
+	if ok {
+		delete(p.joinHints, r.EndpointID)
+	}
+	p.mu.Unlock()
 	if !ok {
 		return res, util.ErrNoHint
 	}
-	delete(p.joinHints, r.EndpointID)
 
 	if hint.Gateway != "" {
 		log.WithFields(log.Fields{
@@ -585,7 +603,9 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 			return
 		}
 
+		p.mu.Lock()
 		p.persistentDHCP[r.EndpointID] = m
+		p.mu.Unlock()
 	}()
 
 	log.WithFields(log.Fields{
@@ -597,13 +617,24 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 	return res, nil
 }
 
-// Leave stops the persistent DHCP client for an endpoint
+// Leave stops the persistent DHCP client for an endpoint. If the plugin has no
+// state for this endpoint (e.g. the daemon restarted between Join and Leave and
+// restoration didn't pick it up), Leave is a no-op rather than an error — that
+// keeps Docker from tearing down a sandbox that's otherwise healthy.
 func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
+	p.mu.Lock()
 	manager, ok := p.persistentDHCP[r.EndpointID]
-	if !ok {
-		return util.ErrNoSandbox
+	if ok {
+		delete(p.persistentDHCP, r.EndpointID)
 	}
-	delete(p.persistentDHCP, r.EndpointID)
+	p.mu.Unlock()
+	if !ok {
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+		}).Warn("Leave called for endpoint without persistent DHCP state — treating as no-op")
+		return nil
+	}
 
 	if err := manager.Stop(); err != nil {
 		return err

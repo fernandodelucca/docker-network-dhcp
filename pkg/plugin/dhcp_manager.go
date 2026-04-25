@@ -38,6 +38,12 @@ type dhcpManager struct {
 	netHandle *netlink.Handle
 	ctrLink   netlink.Link
 
+	// deconfigured is set when udhcpc emits a deconfig event without a fresh
+	// lease. We keep the existing IP in place ("soft handover") and apply the
+	// next bound/renew lease as a replacement to avoid breaking copied routes.
+	deconfigured   bool
+	deconfiguredV6 bool
+
 	stopChan  chan struct{}
 	errChan   chan error
 	errChanV6 chan error
@@ -73,13 +79,47 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 		return fmt.Errorf("failed to parse IP address: %w", err)
 	}
 
-	if !ip.Equal(*lastIP) {
-		// TODO: We can't deal with a different renewed IP for the same reason as described for `bound`
+	deconfigured := m.deconfigured
+	if v6 {
+		deconfigured = m.deconfiguredV6
+	}
+
+	// Replace the IP on the container interface when:
+	//  - the lease IP differs from what we previously installed, or
+	//  - we previously saw a deconfig event and deferred deletion (soft handover).
+	// Note: docker inspect's view of the endpoint address won't refresh — libnetwork
+	// has no API to mutate an endpoint's address outside Leave/Join. The container
+	// itself sees the new IP and traffic flows; the inspect output is a known limitation.
+	if !ip.Equal(*lastIP) || deconfigured {
 		log.
 			WithFields(m.logFields(v6)).
 			WithField("old_ip", lastIP).
 			WithField("new_ip", ip).
-			Warn("udhcpc renew with changed IP")
+			WithField("deconfigured", deconfigured).
+			Info("udhcpc lease replacing IP on container interface")
+
+		if err := m.netHandle.AddrReplace(m.ctrLink, ip); err != nil {
+			return fmt.Errorf("failed to replace IP address: %w", err)
+		}
+		// Best-effort cleanup of the previous address; ignore "not found" since
+		// AddrReplace may already have updated the same prefix in-place.
+		if !ip.Equal(*lastIP) {
+			if err := m.netHandle.AddrDel(m.ctrLink, lastIP); err != nil {
+				log.
+					WithError(err).
+					WithFields(m.logFields(v6)).
+					WithField("ip", lastIP).
+					Debug("failed to delete previous IP (best-effort)")
+			}
+		}
+
+		if v6 {
+			m.LastIPv6 = ip
+			m.deconfiguredV6 = false
+		} else {
+			m.LastIP = ip
+			m.deconfigured = false
+		}
 	}
 
 	if !v6 && info.Gateway != "" {
@@ -152,27 +192,32 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 			select {
 			case event := <-events:
 				switch event.Type {
-				// TODO: We can't really allow the IP in the container to be deleted, it'll delete some of our previously
-				// copied routes. Should this be handled somehow?
-				//case "deconfig":
-				//	ip := m.LastIP
-				//	if v6 {
-				//		ip = m.LastIPv6
-				//	}
-
-				//	log.
-				//		WithFields(m.logFields(v6)).
-				//		WithField("ip", ip).
-				//		Info("udhcpc deconfiguring, deleting previously acquired IP")
-				//	if err := m.netHandle.AddrDel(m.ctrLink, ip); err != nil {
-				//		log.
-				//			WithError(err).
-				//			WithFields(m.logFields(v6)).
-				//			WithField("ip", ip).
-				//			Error("Failed to delete existing udhcpc address")
-				//	}
-				// We're `bound` from the beginning
-				//case "bound":
+				case "deconfig":
+					// Soft handover: don't delete the IP yet. Deleting would also
+					// drop routes copied from the host bridge, breaking connectivity.
+					// Mark the manager as deconfigured so the next bound/renew
+					// performs an AddrReplace as a single atomic transition.
+					log.
+						WithFields(m.logFields(v6)).
+						Info("udhcpc deconfig — deferring IP removal until next lease (soft handover)")
+					if v6 {
+						m.deconfiguredV6 = true
+					} else {
+						m.deconfigured = true
+					}
+				case "bound":
+					// "bound" can fire on initial lease (already handled in CreateEndpoint)
+					// or after a deconfig/lease loss. In the latter case, treat it like
+					// a renew so the IP is replaced and the deconfigured flag clears.
+					log.WithFields(m.logFields(v6)).Debug("udhcpc bound")
+					if err := m.renew(v6, event.Data); err != nil {
+						log.
+							WithError(err).
+							WithFields(m.logFields(v6)).
+							WithField("gateway", event.Data.Gateway).
+							WithField("new_ip", event.Data.IP).
+							Error("Failed to apply bound lease")
+					}
 				case "renew":
 					log.
 						WithFields(m.logFields(v6)).
@@ -292,25 +337,46 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 			return err
 		}
 
-		if m.errChan, err = m.setupClient(false); err != nil {
-			close(m.stopChan)
-			return err
-		}
-
-		if m.opts.IPv6 {
-			if m.errChanV6, err = m.setupClient(true); err != nil {
-				close(m.stopChan)
-				return err
-			}
-		}
-
-		return nil
+		return m.startClients()
 	}(); err != nil {
 		m.netHandle.Delete()
 		m.nsHandle.Close()
 		return err
 	}
 
+	return nil
+}
+
+// startClients launches the persistent udhcpc(6) clients. The caller is
+// responsible for having populated m.ctrLink, m.nsHandle, m.netHandle,
+// m.hostname and m.nsPath before invoking this. On error, m.stopChan is
+// closed and the caller should release the netns/netlink handles.
+func (m *dhcpManager) startClients() error {
+	var err error
+	if m.errChan, err = m.setupClient(false); err != nil {
+		close(m.stopChan)
+		return err
+	}
+	if m.opts.IPv6 {
+		if m.errChanV6, err = m.setupClient(true); err != nil {
+			close(m.stopChan)
+			return err
+		}
+	}
+	return nil
+}
+
+// RestoreClient launches the persistent udhcpc(6) clients for an endpoint
+// whose container is already running and whose interface is already inside
+// the container netns (e.g. after a plugin restart). The caller must populate
+// nsPath, hostname, ctrLink, nsHandle, netHandle, LastIP/LastIPv6 and IfIndex
+// before invoking this.
+func (m *dhcpManager) RestoreClient(ctx context.Context) error {
+	if err := m.startClients(); err != nil {
+		m.netHandle.Delete()
+		m.nsHandle.Close()
+		return err
+	}
 	return nil
 }
 
