@@ -3,6 +3,7 @@ FROM golang:alpine AS builder
 WORKDIR /usr/local/src/docker-net-dhcp
 COPY go.* ./
 RUN go mod download
+RUN go mod tidy
 
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
