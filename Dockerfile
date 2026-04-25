@@ -9,7 +9,7 @@ COPY pkg/ ./pkg/
 RUN mkdir bin/ && go build -o bin/ ./cmd/...
 
 
-FROM alpine:3.14
+FROM alpine:latest
 
 RUN mkdir -p /run/docker/plugins
 
