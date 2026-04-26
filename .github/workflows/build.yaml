@@ -15,6 +15,7 @@ jobs:
       packages: write
       
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       PLUGIN_NAME: ghcr.io/fernandodelucca/docker-network-dhcp
       PLATFORMS: linux/amd64,linux/386,linux/arm64,linux/arm/v7
 
