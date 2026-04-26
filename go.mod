@@ -1,4 +1,4 @@
-module github.com/fernandodelucca/Docker.Network.DHCP
+module github.com/fernandodelucca/docker-network-dhcp
 
 go 1.25.0
 

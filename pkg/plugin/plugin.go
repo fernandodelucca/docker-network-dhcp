@@ -12,11 +12,11 @@ import (
 	docker "github.com/docker/docker/client"
 	"github.com/gorilla/handlers"
 	"github.com/mitchellh/mapstructure"
+	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
-	log "github.com/sirupsen/logrus"
 
-	"github.com/fernandodelucca/Docker.Network.DHCP/pkg/util"
+	"github.com/fernandodelucca/docker-network-dhcp/pkg/util"
 )
 
 // DriverName is the name of the Docker Network Driver

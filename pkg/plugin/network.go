@@ -12,8 +12,8 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/fernandodelucca/Docker.Network.DHCP/pkg/udhcpc"
-	"github.com/fernandodelucca/Docker.Network.DHCP/pkg/util"
+	"github.com/fernandodelucca/docker-network-dhcp/pkg/udhcpc"
+	"github.com/fernandodelucca/docker-network-dhcp/pkg/util"
 )
 
 // CLIOptionsKey is the key used in create network options by the CLI for custom options
@@ -379,18 +379,23 @@ type operInfo struct {
 	HostVEthMAC string `mapstructure:"veth_host_mac"`
 }
 
-// EndpointOperInfo retrieves some info about an existing endpoint
+// EndpointOperInfo retrieves some info about an existing endpoint. Reads
+// bridge/mode from the persisted state when available, falling back to the
+// Docker API only as a last resort. This avoids a deadlock seen in the wild:
+// libnetwork holds locks while cleaning stale endpoints, blocking
+// NetworkInspect for minutes; if we relied on it, EndpointOperInfo would hang
+// the whole cleanup loop.
 func (p *Plugin) EndpointOperInfo(ctx context.Context, r InfoRequest) (InfoResponse, error) {
 	res := InfoResponse{}
 
-	opts, err := p.netOptions(ctx, r.NetworkID)
+	mode, bridge, err := p.endpointModeAndBridge(ctx, r.NetworkID, r.EndpointID)
 	if err != nil {
-		return res, fmt.Errorf("failed to get network options: %w", err)
+		return res, fmt.Errorf("failed to determine endpoint mode/bridge: %w", err)
 	}
 
-	info := operInfo{Bridge: opts.Bridge}
+	info := operInfo{Bridge: bridge}
 
-	if opts.NetMode() == NetworkModeBridge {
+	if mode == NetworkModeBridge {
 		hostName, _ := vethPairNames(r.EndpointID)
 		hostLink, err := netlink.LinkByName(hostName)
 		if err != nil {
@@ -407,36 +412,79 @@ func (p *Plugin) EndpointOperInfo(ctx context.Context, r InfoRequest) (InfoRespo
 	return res, nil
 }
 
-// DeleteEndpoint cleans up the endpoint interface. For bridge mode the host-side veth is deleted (which cascades to
-// remove the container side). For macvlan/ipvlan mode the interface lives in the container namespace and is destroyed
-// automatically when that namespace is torn down, so nothing needs to be done here.
-func (p *Plugin) DeleteEndpoint(ctx context.Context, r DeleteEndpointRequest) error {
-	// Defensive: if Leave didn't get called (or the state file lagged), make
-	// sure DeleteEndpoint also drops the persisted record.
-	defer p.removeStateEntry(r.EndpointID)
-
-	opts, err := p.netOptions(ctx, r.NetworkID)
-	if err != nil {
-		return fmt.Errorf("failed to get network options: %w", err)
+// endpointModeAndBridge returns the network mode and bridge for an endpoint,
+// preferring the persisted state (no API call) and falling back to the Docker
+// API. Empty strings on a missing/unparseable record so callers can decide.
+func (p *Plugin) endpointModeAndBridge(ctx context.Context, networkID, endpointID string) (string, string, error) {
+	p.mu.Lock()
+	state, ok := p.state[endpointID]
+	p.mu.Unlock()
+	if ok {
+		mode := state.Mode
+		if mode == "" {
+			mode = NetworkModeBridge
+		}
+		return mode, state.Bridge, nil
 	}
 
-	if opts.NetMode() != NetworkModeBridge {
+	opts, err := p.netOptions(ctx, networkID)
+	if err != nil {
+		return "", "", err
+	}
+	return opts.NetMode(), opts.Bridge, nil
+}
+
+// DeleteEndpoint cleans up the endpoint interface. Bridge mode: delete the
+// host-side veth (cascades to the container side). Macvlan/ipvlan mode: the
+// interface lives in the container netns and dies when that's torn down.
+//
+// Critically, this handler must NOT depend on the Docker API. In the field we
+// saw dockerd hold libnetwork locks for minutes while cleaning stale
+// endpoints, which made every NetworkInspect call from the plugin block until
+// the 60s timeout. That blocked DeleteEndpoint, dockerd retried in a 3-minute
+// loop, and the host eventually got watchdog-killed. We instead resolve the
+// mode from the persisted state (or fall back to "best effort: try to delete
+// the veth, ignore if absent") and always return success — DeleteEndpoint is
+// inherently a teardown step, so swallowing errors is safer than blocking.
+func (p *Plugin) DeleteEndpoint(ctx context.Context, r DeleteEndpointRequest) error {
+	defer p.removeStateEntry(r.EndpointID)
+
+	p.mu.Lock()
+	state, hasState := p.state[r.EndpointID]
+	p.mu.Unlock()
+
+	if hasState && state.Mode != "" && state.Mode != NetworkModeBridge {
 		log.WithFields(log.Fields{
 			"network":  r.NetworkID[:12],
 			"endpoint": r.EndpointID[:12],
-			"mode":     opts.NetMode(),
-		}).Debug("Skipping host-side interface deletion; container namespace teardown handles cleanup")
+			"mode":     state.Mode,
+		}).Debug("DeleteEndpoint: skipping (interface lives in container netns)")
 		return nil
 	}
 
+	// Either bridge mode (with state) or unknown (no state) — try to delete
+	// the host-side veth. If it doesn't exist we were probably macvlan/ipvlan
+	// or the cleanup already happened; either way, nothing to do.
 	hostName, _ := vethPairNames(r.EndpointID)
 	link, err := netlink.LinkByName(hostName)
 	if err != nil {
-		return fmt.Errorf("failed to lookup host veth interface %v: %w", hostName, err)
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+			"veth":     hostName,
+		}).Debug("DeleteEndpoint: no host veth found, nothing to clean up")
+		return nil
 	}
 
 	if err := netlink.LinkDel(link); err != nil {
-		return fmt.Errorf("failed to delete veth pair: %w", err)
+		// Don't fail — best-effort. dockerd is in a teardown path; refusing
+		// here just makes it retry forever.
+		log.WithError(err).WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+			"veth":     hostName,
+		}).Warn("DeleteEndpoint: failed to delete veth (continuing)")
+		return nil
 	}
 
 	log.WithFields(log.Fields{

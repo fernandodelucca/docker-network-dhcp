@@ -7,7 +7,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/fernandodelucca/Docker.Network.DHCP/pkg/udhcpc"
+	"github.com/fernandodelucca/docker-network-dhcp/pkg/udhcpc"
 )
 
 func main() {

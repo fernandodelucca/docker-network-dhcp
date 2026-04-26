@@ -12,7 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
-	"github.com/fernandodelucca/Docker.Network.DHCP/pkg/plugin"
+	"github.com/fernandodelucca/docker-network-dhcp/pkg/plugin"
 )
 
 var (

@@ -3,7 +3,7 @@ package plugin
 import (
 	"net/http"
 
-	"github.com/fernandodelucca/Docker.Network.DHCP/pkg/util"
+	"github.com/fernandodelucca/docker-network-dhcp/pkg/util"
 )
 
 // Payloads are based on https://github.com/docker/go-plugins-helpers/blob/master/network/api.go
