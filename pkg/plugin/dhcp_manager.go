@@ -103,19 +103,15 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 			WithField("deconfigured", deconfigured).
 			Info("udhcpc lease replacing IP on container interface")
 
-		if err := m.netHandle.AddrReplace(m.ctrLink, ip); err != nil {
-			return fmt.Errorf("failed to replace IP address: %w", err)
+		if err := m.netHandle.AddrDel(m.ctrLink, lastIP); err != nil {
+			log.
+				WithError(err).
+				WithFields(m.logFields(v6)).
+				WithField("ip", lastIP).
+				Debug("failed to delete previous IP (best-effort)")
 		}
-		// Best-effort cleanup of the previous address; ignore "not found" since
-		// AddrReplace may already have updated the same prefix in-place.
-		if !ip.Equal(*lastIP) {
-			if err := m.netHandle.AddrDel(m.ctrLink, lastIP); err != nil {
-				log.
-					WithError(err).
-					WithFields(m.logFields(v6)).
-					WithField("ip", lastIP).
-					Debug("failed to delete previous IP (best-effort)")
-			}
+		if err := m.netHandle.AddrAdd(m.ctrLink, ip); err != nil {
+			return fmt.Errorf("failed to add IP address: %w", err)
 		}
 
 		if v6 {

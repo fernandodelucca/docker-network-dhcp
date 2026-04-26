@@ -153,6 +153,24 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	mux.HandleFunc("/NetworkDriver.Join", p.apiJoin)
 	mux.HandleFunc("/NetworkDriver.Leave", p.apiLeave)
 
+	// Optional libnetwork driver methods we don't implement. Returning 200
+	// with {} (instead of letting ServeMux 404 the path) keeps dockerd from
+	// logging trace-level "method not supported" lines for every endpoint.
+	//   - {Program,Revoke}ExternalConnectivity: NAT / port-map setup. Not
+	//     applicable here — DHCP'd containers sit directly on the physical
+	//     LAN, no NAT or port mapping involved.
+	//   - {Allocate,Free}Network: only used by drivers with cluster scope.
+	//   - Discover{New,Delete}: peer/service discovery for overlay drivers.
+	noop := func(w http.ResponseWriter, r *http.Request) {
+		util.JSONResponse(w, struct{}{}, http.StatusOK)
+	}
+	mux.HandleFunc("/NetworkDriver.ProgramExternalConnectivity", noop)
+	mux.HandleFunc("/NetworkDriver.RevokeExternalConnectivity", noop)
+	mux.HandleFunc("/NetworkDriver.AllocateNetwork", noop)
+	mux.HandleFunc("/NetworkDriver.FreeNetwork", noop)
+	mux.HandleFunc("/NetworkDriver.DiscoverNew", noop)
+	mux.HandleFunc("/NetworkDriver.DiscoverDelete", noop)
+
 	p.server = http.Server{
 		Handler: handlers.CustomLoggingHandler(nil, mux, util.WriteAccessLog),
 	}
