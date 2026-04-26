@@ -208,6 +208,13 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 
 	errChan := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.WithFields(m.logFields(v6)).WithField("panic", fmt.Sprintf("%v", r)).Error("CRITICAL: setupClient event loop panicked — recovered from panic")
+				errChan <- fmt.Errorf("setupClient event loop panic: %v", r)
+			}
+		}()
+
 		for {
 			select {
 			case event, ok := <-events:
@@ -216,6 +223,7 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 					errChan <- fmt.Errorf("udhcpc%s process exited unexpectedly", map[bool]string{true: "6"}[v6])
 					return
 				}
+				log.WithFields(m.logFields(v6)).WithField("event_type", event.Type).Trace("udhcpc event received")
 				switch event.Type {
 				case "deconfig":
 					// udhcpc always emits deconfig once at startup (before
@@ -303,7 +311,11 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 }
 
 func (m *dhcpManager) Start(ctx context.Context) error {
+	startTime := time.Now()
+	log.WithFields(m.logFields(false)).Info("DHCP manager starting")
+
 	var ctrID string
+	log.WithFields(m.logFields(false)).Trace("Awaiting container ID on network")
 	if err := util.AwaitCondition(ctx, func() (bool, error) {
 		dockerNet, err := m.docker.NetworkInspect(ctx, m.joinReq.NetworkID, dNetwork.InspectOptions{})
 		if err != nil {
@@ -325,26 +337,36 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 	}, pollTime); err != nil {
 		return err
 	}
+	log.WithFields(m.logFields(false)).WithField("container_id", ctrID[:12]).Debug("Container ID found on network")
 
+	log.WithFields(m.logFields(false)).Trace("Awaiting container inspection")
 	ctr, err := util.AwaitContainerInspect(ctx, m.docker, ctrID, pollTime)
 	if err != nil {
 		return fmt.Errorf("failed to get Docker container info: %w", err)
 	}
+	log.WithFields(m.logFields(false)).WithField("pid", ctr.State.Pid).Debug("Container PID obtained")
 
 	// Using the "sandbox key" directly causes issues on some platforms
 	m.nsPath = fmt.Sprintf("/proc/%v/ns/net", ctr.State.Pid)
 	m.hostname = ctr.Config.Hostname
+	log.WithFields(m.logFields(false)).WithFields(log.Fields{
+		"ns_path":  m.nsPath,
+		"hostname": m.hostname,
+	}).Trace("Container namespace path and hostname configured")
 
+	log.WithFields(m.logFields(false)).Trace("Awaiting network namespace")
 	m.nsHandle, err = util.AwaitNetNS(ctx, m.nsPath, pollTime)
 	if err != nil {
 		return fmt.Errorf("failed to get sandbox network namespace: %w", err)
 	}
+	log.WithFields(m.logFields(false)).Debug("Network namespace opened")
 
 	m.netHandle, err = netlink.NewHandleAt(m.nsHandle)
 	if err != nil {
 		m.nsHandle.Close()
 		return fmt.Errorf("failed to open netlink handle in sandbox namespace: %w", err)
 	}
+	log.WithFields(m.logFields(false)).Debug("Netlink handle opened")
 
 	if err := func() error {
 		var ctrIndex int
@@ -392,6 +414,8 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 		return err
 	}
 
+	duration := time.Since(startTime)
+	log.WithFields(m.logFields(false)).WithField("duration_ms", duration.Milliseconds()).Info("DHCP manager started successfully with persistent clients")
 	return nil
 }
 
@@ -431,22 +455,32 @@ func (m *dhcpManager) RestoreClient(ctx context.Context) error {
 
 func (m *dhcpManager) Stop() error {
 	if !m.started {
+		log.WithFields(m.logFields(false)).Debug("Stop: manager not started, skipping")
 		return nil
 	}
+
+	startTime := time.Now()
+	log.WithFields(m.logFields(false)).Info("Stopping persistent DHCP clients")
 
 	defer m.nsHandle.Close()
 	defer m.netHandle.Delete()
 
 	m.closeStopChan()
+	log.WithFields(m.logFields(false)).Trace("Stop: signaled clients to shutdown")
 
 	if err := <-m.errChan; err != nil {
+		log.WithFields(m.logFields(false)).WithError(err).Warn("DHCPv4 client shutdown reported error")
 		return fmt.Errorf("failed shut down DHCP client: %w", err)
 	}
 	if m.opts.IPv6 {
 		if err := <-m.errChanV6; err != nil {
+			log.WithFields(m.logFields(true)).WithError(err).Warn("DHCPv6 client shutdown reported error")
 			return fmt.Errorf("failed shut down DHCPv6 client: %w", err)
 		}
 	}
+
+	duration := time.Since(startTime)
+	log.WithFields(m.logFields(false)).WithField("duration_ms", duration.Milliseconds()).Info("Persistent DHCP clients stopped")
 
 	return nil
 }

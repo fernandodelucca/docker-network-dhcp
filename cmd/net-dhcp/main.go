@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -45,6 +46,12 @@ func main() {
 		log.StandardLogger().Out = f
 	}
 
+	log.WithFields(log.Fields{
+		"log_level": *logLevel,
+		"socket":    *bindSock,
+		"logfile":   *logFile,
+	}).Info("Plugin starting up")
+
 	awaitTimeout := 10 * time.Second
 	if t, ok := os.LookupEnv("AWAIT_TIMEOUT"); ok {
 		awaitTimeout, err = time.ParseDuration(t)
@@ -52,6 +59,7 @@ func main() {
 			log.WithError(err).Fatal("Failed to parse await timeout")
 		}
 	}
+	log.WithField("await_timeout", awaitTimeout).Debug("Container await timeout configured")
 
 	p, err := plugin.NewPlugin(awaitTimeout)
 	if err != nil {
@@ -68,6 +76,14 @@ func main() {
 	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.WithFields(log.Fields{
+					"panic":     fmt.Sprintf("%v", r),
+					"goroutine": "http-server",
+				}).Error("CRITICAL: HTTP server goroutine panicked")
+			}
+		}()
 		log.Info("Starting server...")
 		// http.ErrServerClosed is the expected return when Close() is called
 		// during graceful shutdown — don't escalate that to Fatal.

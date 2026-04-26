@@ -134,6 +134,22 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
 	}
 
+	// Log Docker daemon info including negotiated API version
+	serverInfo, err := client.ServerVersion(context.Background())
+	if err == nil {
+		log.WithFields(log.Fields{
+			"api_version":     serverInfo.APIVersion,
+			"os":              serverInfo.OS,
+			"arch":            serverInfo.Arch,
+			"docker_version":  serverInfo.Version,
+			"kernel_version":  serverInfo.KernelVersion,
+			"experimental":    serverInfo.Experimental,
+			"build_time":      serverInfo.BuildTime,
+		}).Info("Connected to Docker daemon with API version negotiation")
+	} else {
+		log.WithError(err).Warn("Failed to fetch Docker daemon info (connection may succeed later)")
+	}
+
 	persisted, err := loadState()
 	if err != nil {
 		// Don't fail startup over a corrupt state file: log and continue with
@@ -141,6 +157,8 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 		// in-memory state, which is the source of truth at runtime.
 		log.WithError(err).Warn("Failed to load persisted state — starting empty")
 		persisted = map[string]endpointState{}
+	} else {
+		log.WithField("persisted_endpoints", len(persisted)).Debug("Loaded persisted endpoint state from disk")
 	}
 
 	p := Plugin{
@@ -250,18 +268,29 @@ func (p *Plugin) Restore(ctx context.Context) error {
 		return nil
 	}
 
+	log.WithField("total_endpoints", len(snapshot)).Info("Restore: starting recovery of persisted endpoints")
+
 	restored := 0
 	dropped := 0
 	for _, e := range snapshot {
 		if err := ctx.Err(); err != nil {
+			log.WithError(err).Info("Restore: cancelled by context")
 			return err
 		}
+		log.WithFields(log.Fields{
+			"network":  shortID(e.NetworkID),
+			"endpoint": shortID(e.EndpointID),
+			"sandbox":  e.SandboxKey,
+			"mode":     e.Mode,
+			"bridge":   e.Bridge,
+		}).Trace("Restore: attempting to recover endpoint")
+
 		if err := p.restoreFromState(ctx, e); err != nil {
 			log.WithError(err).WithFields(log.Fields{
-				"network":  e.NetworkID[:12],
-				"endpoint": e.EndpointID[:12],
+				"network":  shortID(e.NetworkID),
+				"endpoint": shortID(e.EndpointID),
 				"sandbox":  e.SandboxKey,
-			}).Warn("Restore: dropping endpoint (sandbox gone or interface missing)")
+			}).Warn("Restore: dropping endpoint (failed to restore)")
 			p.removeStateEntry(e.EndpointID)
 			dropped++
 			continue
@@ -271,27 +300,38 @@ func (p *Plugin) Restore(ctx context.Context) error {
 	log.WithFields(log.Fields{
 		"restored": restored,
 		"dropped":  dropped,
+		"total":    len(snapshot),
 	}).Info("Restore complete")
 	return nil
 }
 
 // restoreFromState rebuilds a single dhcpManager from a persisted record.
 func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
+	logFields := log.Fields{
+		"network":  shortID(e.NetworkID),
+		"endpoint": shortID(e.EndpointID),
+		"sandbox":  e.SandboxKey,
+	}
+
 	// If a fresh Join already registered this endpoint, don't double-attach.
 	p.mu.Lock()
 	_, exists := p.persistentDHCP[e.EndpointID]
 	p.mu.Unlock()
 	if exists {
+		log.WithFields(logFields).Trace("Restore: endpoint already restored by concurrent Join")
 		return nil
 	}
 
 	// SandboxKey points at the container's netns. After a reboot the tmpfs
 	// entry is gone; that's how we detect "container is gone" without needing
 	// the Docker API.
+	log.WithFields(logFields).Trace("Restore: opening network namespace")
 	nsHandle, err := netns.GetFromPath(e.SandboxKey)
 	if err != nil {
 		return fmt.Errorf("open netns %s: %w", e.SandboxKey, err)
 	}
+
+	log.WithFields(logFields).Trace("Restore: opening netlink handle in namespace")
 	netHandle, err := netlink.NewHandleAt(nsHandle)
 	if err != nil {
 		nsHandle.Close()
@@ -302,12 +342,14 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 		nsHandle.Close()
 	}
 
+	log.WithFields(logFields).Trace("Restore: locating endpoint interface")
 	ctrLink, ifIndex, err := findEndpointLinkFromState(netHandle, e)
 	if err != nil {
 		cleanup()
 		return fmt.Errorf("find endpoint interface: %w", err)
 	}
 
+	log.WithFields(logFields).Trace("Restore: reading current IPv4 address")
 	v4Addrs, err := netHandle.AddrList(ctrLink, netlinkFamilyV4)
 	if err != nil {
 		cleanup()
@@ -324,9 +366,11 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 		cleanup()
 		return fmt.Errorf("no IPv4 address on interface")
 	}
+	log.WithFields(logFields).WithField("ipv4", lastV4.String()).Trace("Restore: IPv4 address found")
 
 	var lastV6 *netlink.Addr
 	if e.IPv6 {
+		log.WithFields(logFields).Trace("Restore: reading current IPv6 address")
 		v6Addrs, err := netHandle.AddrList(ctrLink, netlinkFamilyV6)
 		if err != nil {
 			cleanup()
@@ -338,6 +382,9 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 				break
 			}
 		}
+		if lastV6 != nil {
+			log.WithFields(logFields).WithField("ipv6", lastV6.String()).Trace("Restore: IPv6 address found")
+		}
 	}
 
 	opts := DHCPNetworkOptions{
@@ -346,6 +393,7 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 		IPv6:   e.IPv6,
 	}
 
+	log.WithFields(logFields).WithField("mode", e.Mode).Trace("Restore: creating DHCP manager")
 	m := newDHCPManager(p.docker, JoinRequest{
 		NetworkID:  e.NetworkID,
 		EndpointID: e.EndpointID,
@@ -360,6 +408,7 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 	m.netHandle = netHandle
 	m.ctrLink = ctrLink
 
+	log.WithFields(logFields).Trace("Restore: starting DHCP clients")
 	if err := m.RestoreClient(ctx); err != nil {
 		// RestoreClient closes nsHandle/netHandle on its own error path
 		return fmt.Errorf("start clients: %w", err)
@@ -371,23 +420,29 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 	p.mu.Lock()
 	if _, exists := p.persistentDHCP[e.EndpointID]; exists {
 		p.mu.Unlock()
+		log.WithFields(logFields).Debug("Restore: concurrent Join arrived, discarding our restored manager")
 		_ = m.Stop() // Join concurrent arrived first; discard our restored manager
 		return nil
 	}
 	if _, left := p.leftEndpoints[e.EndpointID]; left {
 		delete(p.leftEndpoints, e.EndpointID)
 		p.mu.Unlock()
+		log.WithFields(logFields).Debug("Restore: endpoint was left during restore, stopping manager")
 		_ = m.Stop()
 		return fmt.Errorf("endpoint was left during restore")
 	}
 	p.persistentDHCP[e.EndpointID] = m
 	p.mu.Unlock()
 
-	log.WithFields(log.Fields{
-		"network":  e.NetworkID[:12],
-		"endpoint": e.EndpointID[:12],
-		"ip":       lastV4.String(),
-	}).Info("Restore: re-attached persistent DHCP client")
+	log.WithFields(logFields).WithFields(log.Fields{
+		"ipv4": lastV4.String(),
+		"ipv6": func() string {
+			if lastV6 != nil {
+				return lastV6.String()
+			}
+			return "none"
+		}(),
+	}).Info("Restore: re-attached persistent DHCP client successfully")
 	return nil
 }
 
@@ -465,11 +520,16 @@ func (p *Plugin) StartRestore() {
 		defer p.restoreWg.Done()
 		defer cancel()
 		defer func() {
+			if r := recover(); r != nil {
+				log.WithField("panic", fmt.Sprintf("%v", r)).Error("CRITICAL: Restore goroutine panicked — recovered from panic")
+			}
 			p.mu.Lock()
 			p.restoreCancel = nil
 			p.mu.Unlock()
 		}()
+		log.Info("Restore phase: waiting 10s for dockerd to load containers...")
 		time.Sleep(10 * time.Second)
+		log.Info("Restore phase: starting recovery of persisted endpoints")
 		if err := p.Restore(ctx); err != nil {
 			log.WithError(err).Error("Restore phase reported errors")
 		}

@@ -18,6 +18,9 @@ func AwaitContainerInspect(ctx context.Context, docker *client.Client, id string
 	ctrChan := make(chan types.ContainerJSON)
 	go func() {
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			var ctr types.ContainerJSON
 			ctr, err = docker.ContainerInspect(ctx, id)
 			if err == nil {
@@ -25,7 +28,11 @@ func AwaitContainerInspect(ctx context.Context, docker *client.Client, id string
 				return
 			}
 
-			time.Sleep(interval)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
 		}
 	}()
 

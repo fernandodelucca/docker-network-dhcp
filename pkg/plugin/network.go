@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	dNetwork "github.com/docker/docker/api/types/network"
 	"github.com/mitchellh/mapstructure"
@@ -24,12 +25,22 @@ const CLIOptionsKey string = "com.docker.network.generic"
 
 // CreateNetwork "creates" a new DHCP network (validates the interface and IPAM settings)
 func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
-	log.WithField("options", r.Options).Debug("CreateNetwork options")
+	log.WithField("network_id", shortID(r.NetworkID)).Debug("CreateNetwork: decoding options")
 
 	opts, err := decodeOpts(r.Options[util.OptionsKeyGeneric])
 	if err != nil {
 		return fmt.Errorf("failed to decode network options: %w", err)
 	}
+
+	log.WithFields(log.Fields{
+		"network_id":      shortID(r.NetworkID),
+		"bridge":          opts.Bridge,
+		"mode":            opts.NetMode(),
+		"ipv6":            opts.IPv6,
+		"lease_timeout":   opts.LeaseTimeout,
+		"skip_routes":     opts.SkipRoutes,
+		"ignore_conflicts": opts.IgnoreConflicts,
+	}).Debug("CreateNetwork: decoded options")
 
 	switch opts.NetMode() {
 	case NetworkModeBridge, NetworkModeMacvlan, NetworkModeIPvlan:
@@ -152,7 +163,13 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 // In bridge mode a veth pair is used; in macvlan/ipvlan mode a directly-attached sub-interface is created on the
 // parent NIC. Docker will move the interface into the container's namespace and apply the address.
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
-	log.WithField("options", r.Options).Debug("CreateEndpoint options")
+	startTime := time.Now()
+	logFields := log.Fields{
+		"network":  shortID(r.NetworkID),
+		"endpoint": shortID(r.EndpointID),
+	}
+	log.WithFields(logFields).Debug("CreateEndpoint: starting")
+
 	res := CreateEndpointResponse{
 		Interface: &EndpointInterface{},
 	}
@@ -166,11 +183,13 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	if err != nil {
 		return res, fmt.Errorf("failed to get network options: %w", err)
 	}
+	log.WithFields(logFields).WithField("mode", opts.NetMode()).Debug("CreateEndpoint: using network mode")
 
 	timeout := defaultLeaseTimeout
 	if opts.LeaseTimeout != 0 {
 		timeout = opts.LeaseTimeout
 	}
+	log.WithFields(logFields).WithField("lease_timeout", timeout).Debug("CreateEndpoint: lease timeout configured")
 
 	// initialIP runs udhcpc on ifName to obtain an IP and stores it in joinHints.
 	initialIP := func(ifName string, v6 bool) error {
@@ -360,15 +379,16 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	gateway := p.joinHints[r.EndpointID].Gateway
 	p.mu.Unlock()
 
-	log.WithFields(log.Fields{
-		"network":     r.NetworkID[:12],
-		"endpoint":    r.EndpointID[:12],
-		"mode":        opts.NetMode(),
-		"mac_address": res.Interface.MacAddress,
-		"ip":          res.Interface.Address,
-		"ipv6":        res.Interface.AddressIPv6,
-		"gateway":     fmt.Sprintf("%#v", gateway),
-	}).Info("Endpoint created")
+	duration := time.Since(startTime)
+	log.WithFields(logFields).WithFields(log.Fields{
+		"mode":         opts.NetMode(),
+		"mac_address":  res.Interface.MacAddress,
+		"ip":           res.Interface.Address,
+		"ipv6":         res.Interface.AddressIPv6,
+		"gateway":      fmt.Sprintf("%#v", gateway),
+		"duration_ms":  duration.Milliseconds(),
+		"skip_routes":  opts.SkipRoutes,
+	}).Info("CreateEndpoint: completed successfully")
 
 	return res, nil
 }
@@ -451,6 +471,12 @@ func (p *Plugin) endpointModeAndBridge(ctx context.Context, networkID, endpointI
 // the veth, ignore if absent") and always return success — DeleteEndpoint is
 // inherently a teardown step, so swallowing errors is safer than blocking.
 func (p *Plugin) DeleteEndpoint(ctx context.Context, r DeleteEndpointRequest) error {
+	logFields := log.Fields{
+		"network":  shortID(r.NetworkID),
+		"endpoint": shortID(r.EndpointID),
+	}
+	log.WithFields(logFields).Debug("DeleteEndpoint: starting")
+
 	defer p.removeStateEntry(r.EndpointID)
 
 	p.mu.Lock()
@@ -458,11 +484,7 @@ func (p *Plugin) DeleteEndpoint(ctx context.Context, r DeleteEndpointRequest) er
 	p.mu.Unlock()
 
 	if hasState && state.Mode != "" && state.Mode != NetworkModeBridge {
-		log.WithFields(log.Fields{
-			"network":  r.NetworkID[:12],
-			"endpoint": r.EndpointID[:12],
-			"mode":     state.Mode,
-		}).Debug("DeleteEndpoint: skipping (interface lives in container netns)")
+		log.WithFields(logFields).WithField("mode", state.Mode).Debug("DeleteEndpoint: skipping veth cleanup (interface lives in container netns)")
 		return nil
 	}
 
@@ -472,29 +494,18 @@ func (p *Plugin) DeleteEndpoint(ctx context.Context, r DeleteEndpointRequest) er
 	hostName, _ := vethPairNames(r.EndpointID)
 	link, err := netlink.LinkByName(hostName)
 	if err != nil {
-		log.WithFields(log.Fields{
-			"network":  r.NetworkID[:12],
-			"endpoint": r.EndpointID[:12],
-			"veth":     hostName,
-		}).Debug("DeleteEndpoint: no host veth found, nothing to clean up")
+		log.WithFields(logFields).WithField("veth", hostName).Debug("DeleteEndpoint: no host veth found")
 		return nil
 	}
 
 	if err := netlink.LinkDel(link); err != nil {
 		// Don't fail — best-effort. dockerd is in a teardown path; refusing
 		// here just makes it retry forever.
-		log.WithError(err).WithFields(log.Fields{
-			"network":  r.NetworkID[:12],
-			"endpoint": r.EndpointID[:12],
-			"veth":     hostName,
-		}).Warn("DeleteEndpoint: failed to delete veth (continuing)")
+		log.WithError(err).WithFields(logFields).WithField("veth", hostName).Warn("DeleteEndpoint: failed to delete veth (continuing anyway)")
 		return nil
 	}
 
-	log.WithFields(log.Fields{
-		"network":  r.NetworkID[:12],
-		"endpoint": r.EndpointID[:12],
-	}).Info("Endpoint deleted")
+	log.WithFields(logFields).Info("DeleteEndpoint: veth deleted successfully")
 
 	return nil
 }
@@ -585,13 +596,23 @@ func (p *Plugin) addRoutes(opts *DHCPNetworkOptions, v6 bool, bridge netlink.Lin
 // Join passes the veth name and route information (gateway from DHCP and existing routes on the host bridge) to Docker
 // and starts a persistent DHCP client to maintain the lease on the acquired IP
 func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) {
-	log.WithField("options", r.Options).Debug("Join options")
+	startTime := time.Now()
+	logFields := log.Fields{
+		"network":  shortID(r.NetworkID),
+		"endpoint": shortID(r.EndpointID),
+		"sandbox":  r.SandboxKey,
+	}
+	log.WithFields(logFields).Debug("Join: starting")
 	res := JoinResponse{}
 
 	opts, err := p.netOptions(ctx, r.NetworkID)
 	if err != nil {
 		return res, fmt.Errorf("failed to get network options: %w", err)
 	}
+	log.WithFields(logFields).WithFields(log.Fields{
+		"mode":       opts.NetMode(),
+		"skip_routes": opts.SkipRoutes,
+	}).Debug("Join: network options loaded")
 
 	var srcName, dstPrefix string
 	if opts.NetMode() == NetworkModeBridge {
@@ -606,6 +627,10 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		SrcName:   srcName,
 		DstPrefix: dstPrefix,
 	}
+	log.WithFields(logFields).WithFields(log.Fields{
+		"src_name":   srcName,
+		"dst_prefix": dstPrefix,
+	}).Trace("Join: interface naming configured")
 
 	p.mu.Lock()
 	hint, ok := p.joinHints[r.EndpointID]
@@ -642,6 +667,15 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 	}
 
 	go func() {
+		defer func() {
+			if recoverPanic := recover(); recoverPanic != nil {
+				log.WithFields(logFields).WithFields(log.Fields{
+					"panic":     fmt.Sprintf("%v", recoverPanic),
+					"goroutine": "join-dhcp-manager",
+				}).Error("CRITICAL: Join goroutine panicked — recovered from panic")
+			}
+		}()
+
 		ctx, cancel := context.WithTimeout(context.Background(), p.awaitTimeout)
 		p.mu.Lock()
 		p.cancelJoin[r.EndpointID] = cancel
@@ -696,11 +730,13 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		})
 	}()
 
-	log.WithFields(log.Fields{
-		"network":  r.NetworkID[:12],
-		"endpoint": r.EndpointID[:12],
-		"sandbox":  r.SandboxKey,
-	}).Info("Joined sandbox to endpoint")
+	duration := time.Since(startTime)
+	log.WithFields(logFields).WithFields(log.Fields{
+		"static_routes": len(res.StaticRoutes),
+		"ipv4_gateway":  res.Gateway,
+		"ipv6_gateway":  res.GatewayIPv6,
+		"duration_ms":   duration.Milliseconds(),
+	}).Info("Join: completed, DHCP client starting asynchronously")
 
 	return res, nil
 }
@@ -710,6 +746,13 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 // restoration didn't pick it up), Leave is a no-op rather than an error — that
 // keeps Docker from tearing down a sandbox that's otherwise healthy.
 func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
+	startTime := time.Now()
+	logFields := log.Fields{
+		"network":  shortID(r.NetworkID),
+		"endpoint": shortID(r.EndpointID),
+	}
+	log.WithFields(logFields).Debug("Leave: starting")
+
 	// Always drop the persisted record on Leave, regardless of whether we
 	// still have an in-memory manager. Otherwise a stale entry would survive
 	// a plugin restart and cause a phantom Restore for a long-gone endpoint.
@@ -723,32 +766,26 @@ func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
 		// Join goroutine may be in-flight — cancel it and mark as left
 		if cancel, pending := p.cancelJoin[r.EndpointID]; pending {
 			cancel()
-			log.WithFields(log.Fields{
-				"network":  r.NetworkID[:12],
-				"endpoint": r.EndpointID[:12],
-			}).Debug("Leave: cancelled in-flight Join goroutine")
+			log.WithFields(logFields).Debug("Leave: cancelled in-flight Join goroutine")
 		}
 		p.leftEndpoints[r.EndpointID] = struct{}{}
 	}
 	p.mu.Unlock()
 	if !ok {
 		if manager == nil {
-			log.WithFields(log.Fields{
-				"network":  r.NetworkID[:12],
-				"endpoint": r.EndpointID[:12],
-			}).Warn("Leave called for endpoint without persistent DHCP state — treating as no-op")
+			log.WithFields(logFields).Warn("Leave called for endpoint without persistent DHCP state — treating as no-op")
 			return nil
 		}
 	}
 
+	log.WithFields(logFields).Debug("Leave: stopping persistent DHCP client")
 	if err := manager.Stop(); err != nil {
+		log.WithFields(logFields).WithError(err).Error("Leave: failed to stop DHCP client")
 		return err
 	}
 
-	log.WithFields(log.Fields{
-		"network":  r.NetworkID[:12],
-		"endpoint": r.EndpointID[:12],
-	}).Info("Sandbox left endpoint")
+	duration := time.Since(startTime)
+	log.WithFields(logFields).WithField("duration_ms", duration.Milliseconds()).Info("Leave: completed successfully")
 
 	return nil
 }
