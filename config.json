@@ -38,6 +38,15 @@
             "options": [
                 "bind"
             ]
+        },
+        {
+            "source": "/var/lib/net-dhcp",
+            "destination": "/var/lib/net-dhcp",
+            "type": "bind",
+            "options": [
+                "bind",
+                "rshared"
+            ]
         }
     ],
     "linux": {

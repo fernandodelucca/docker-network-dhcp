@@ -411,6 +411,10 @@ func (p *Plugin) EndpointOperInfo(ctx context.Context, r InfoRequest) (InfoRespo
 // remove the container side). For macvlan/ipvlan mode the interface lives in the container namespace and is destroyed
 // automatically when that namespace is torn down, so nothing needs to be done here.
 func (p *Plugin) DeleteEndpoint(ctx context.Context, r DeleteEndpointRequest) error {
+	// Defensive: if Leave didn't get called (or the state file lagged), make
+	// sure DeleteEndpoint also drops the persisted record.
+	defer p.removeStateEntry(r.EndpointID)
+
 	opts, err := p.netOptions(ctx, r.NetworkID)
 	if err != nil {
 		return fmt.Errorf("failed to get network options: %w", err)
@@ -606,6 +610,19 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		p.mu.Lock()
 		p.persistentDHCP[r.EndpointID] = m
 		p.mu.Unlock()
+
+		// Persist enough state to rebuild this manager after a plugin restart
+		// without needing the Docker API to be responsive.
+		p.addStateEntry(endpointState{
+			NetworkID:  r.NetworkID,
+			EndpointID: r.EndpointID,
+			SandboxKey: r.SandboxKey,
+			Mode:       opts.NetMode(),
+			Bridge:     opts.Bridge,
+			IPv6:       opts.IPv6,
+			IfIndex:    hint.IfIndex,
+			Hostname:   m.hostname,
+		})
 	}()
 
 	log.WithFields(log.Fields{
@@ -622,6 +639,11 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 // restoration didn't pick it up), Leave is a no-op rather than an error — that
 // keeps Docker from tearing down a sandbox that's otherwise healthy.
 func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
+	// Always drop the persisted record on Leave, regardless of whether we
+	// still have an in-memory manager. Otherwise a stale entry would survive
+	// a plugin restart and cause a phantom Restore for a long-gone endpoint.
+	defer p.removeStateEntry(r.EndpointID)
+
 	p.mu.Lock()
 	manager, ok := p.persistentDHCP[r.EndpointID]
 	if ok {

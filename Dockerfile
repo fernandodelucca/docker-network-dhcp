@@ -12,7 +12,7 @@ RUN mkdir bin/ && go build -o bin/ ./cmd/...
 
 FROM alpine:latest
 
-RUN mkdir -p /run/docker/plugins
+RUN mkdir -p /run/docker/plugins /var/lib/net-dhcp
 
 COPY --from=builder /usr/local/src/docker-net-dhcp/bin/net-dhcp /usr/sbin/
 COPY --from=builder /usr/local/src/docker-net-dhcp/bin/udhcpc-handler /usr/lib/net-dhcp/udhcpc-handler

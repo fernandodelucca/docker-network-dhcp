@@ -61,10 +61,19 @@ func main() {
 
 	// Re-attach persistent DHCP clients to containers that survived a daemon
 	// restart. Runs in the background because the plugin starts before dockerd
-	// finishes "Loading containers" — the Docker API may not list anything for
-	// several seconds. Restore handles its own readiness wait via Ping.
+	// finishes "Loading containers" — Restore handles its own readiness wait.
+	//
+	// The 10s delay avoids a deadlock observed in real reboots: dockerd holds
+	// an internal lock while waiting for plugins to enter ready state, and any
+	// API call from the plugin during that window blocks until the lock is
+	// released. Sleeping past that window before issuing the first Ping lets
+	// dockerd finish plugin loading and start serving API requests normally.
+	//
+	// The 5-minute context covers post-boot IO/CPU pressure: in observed
+	// reboots the daemon stayed slow well past the original 60s ceiling.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		time.Sleep(10 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		if err := p.Restore(ctx); err != nil {
 			log.WithError(err).Error("Restore phase reported errors")

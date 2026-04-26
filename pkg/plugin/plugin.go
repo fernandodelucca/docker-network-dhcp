@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	dNetwork "github.com/docker/docker/api/types/network"
 	docker "github.com/docker/docker/client"
 	"github.com/gorilla/handlers"
 	"github.com/mitchellh/mapstructure"
@@ -100,20 +99,35 @@ type Plugin struct {
 	mu             sync.Mutex
 	joinHints      map[string]joinHint
 	persistentDHCP map[string]*dhcpManager
+	// state mirrors what's been persisted to disk under stateDir/stateFile.
+	// Keyed by EndpointID. Rewritten atomically whenever Join/Leave runs so
+	// that a restart can rebuild persistentDHCP without depending on the
+	// Docker API being responsive (which can deadlock during plugin loading).
+	state map[string]endpointState
 }
 
 // NewPlugin creates a new Plugin
 func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
-	// 30s is generous on purpose: during a `dockerd` restart the API socket may
-	// be slow to respond for several seconds. The previous 2s default caused
-	// netOptions/Leave/EndpointOperInfo to fail right after restart with
-	// "context deadline exceeded".
+	// 60s is generous on purpose: during a `dockerd` restart or under post-boot
+	// IO/CPU pressure, the API socket can be slow for tens of seconds. The
+	// original 2s default caused netOptions/Leave/EndpointOperInfo to fail with
+	// "context deadline exceeded" right after restart. 30s wasn't enough either
+	// in some real reboots — bumped to 60s to cover the worst observed lag.
 	client, err := docker.NewClientWithOpts(
 		docker.WithAPIVersionNegotiation(),
-		docker.WithTimeout(30*time.Second),
+		docker.WithTimeout(60*time.Second),
 		docker.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
+	}
+
+	persisted, err := loadState()
+	if err != nil {
+		// Don't fail startup over a corrupt state file: log and continue with
+		// an empty table. The next Join/Leave will rewrite the file from
+		// in-memory state, which is the source of truth at runtime.
+		log.WithError(err).Warn("Failed to load persisted state — starting empty")
+		persisted = map[string]endpointState{}
 	}
 
 	p := Plugin{
@@ -123,6 +137,7 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 
 		joinHints:      make(map[string]joinHint),
 		persistentDHCP: make(map[string]*dhcpManager),
+		state:          persisted,
 	}
 
 	mux := http.NewServeMux()
@@ -145,111 +160,105 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	return &p, nil
 }
 
-// Restore re-attaches persistent DHCP clients to containers that survived a
-// plugin restart. It enumerates Docker networks driven by this plugin, locates
-// each running container's interface inside its netns, reads the current IP(s)
-// and starts a fresh udhcpc to keep the lease alive. Failures for individual
-// endpoints are logged but do not abort the overall restore — partial recovery
-// is preferable to refusing to start.
-//
-// The plugin starts before dockerd finishes "Loading containers", so the Docker
-// API may not list containers yet. We retry Ping until the daemon responds (or
-// the ctx expires) before issuing NetworkList.
-func (p *Plugin) Restore(ctx context.Context) error {
-	if err := util.AwaitCondition(ctx, func() (bool, error) {
-		_, err := p.docker.Ping(ctx)
-		if err != nil {
-			log.WithError(err).Debug("Restore: waiting for Docker daemon")
-			return false, nil
-		}
-		return true, nil
-	}, time.Second); err != nil {
-		return fmt.Errorf("docker daemon never became ready: %w", err)
+// addStateEntry persists a new endpoint record to disk. Logs but does not
+// return errors: failing to persist is bad, but it must not break the live
+// Join — connectivity right now matters more than a clean restart later.
+func (p *Plugin) addStateEntry(e endpointState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.state[e.EndpointID] = e
+	if err := saveStateLocked(p.state); err != nil {
+		log.WithError(err).WithField("endpoint", e.EndpointID[:12]).
+			Warn("Failed to persist endpoint state")
 	}
+}
 
-	nets, err := p.docker.NetworkList(ctx, dNetwork.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list networks: %w", err)
+// removeStateEntry drops an endpoint record from disk. Same logging-only
+// policy as addStateEntry.
+func (p *Plugin) removeStateEntry(endpointID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.state[endpointID]; !ok {
+		return
+	}
+	delete(p.state, endpointID)
+	if err := saveStateLocked(p.state); err != nil {
+		log.WithError(err).WithField("endpoint", endpointID[:12]).
+			Warn("Failed to update persisted state on remove")
+	}
+}
+
+// Restore re-attaches persistent DHCP clients to endpoints that survived a
+// plugin restart. It is driven entirely by the persisted state file — no calls
+// to the Docker API — so it cannot deadlock against dockerd while dockerd is
+// holding its plugin-loading lock. Endpoints whose sandbox netns is gone (e.g.
+// after a host reboot) are silently dropped from the state file.
+func (p *Plugin) Restore(ctx context.Context) error {
+	p.mu.Lock()
+	snapshot := make([]endpointState, 0, len(p.state))
+	for _, e := range p.state {
+		snapshot = append(snapshot, e)
+	}
+	p.mu.Unlock()
+
+	if len(snapshot) == 0 {
+		log.Info("Restore complete (no persisted state)")
+		return nil
 	}
 
 	restored := 0
-	for _, n := range nets {
-		if !IsDHCPPlugin(n.Driver) {
+	dropped := 0
+	for _, e := range snapshot {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := p.restoreFromState(ctx, e); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"network":  e.NetworkID[:12],
+				"endpoint": e.EndpointID[:12],
+				"sandbox":  e.SandboxKey,
+			}).Warn("Restore: dropping endpoint (sandbox gone or interface missing)")
+			p.removeStateEntry(e.EndpointID)
+			dropped++
 			continue
 		}
-
-		opts, err := decodeOpts(n.Options)
-		if err != nil {
-			log.WithError(err).WithField("network", n.Name).Warn("Restore: failed to decode network options, skipping")
-			continue
-		}
-
-		// NetworkInspect returns the per-endpoint container map keyed by container ID
-		netInfo, err := p.docker.NetworkInspect(ctx, n.ID, dNetwork.InspectOptions{})
-		if err != nil {
-			log.WithError(err).WithField("network", n.Name).Warn("Restore: failed to inspect network, skipping")
-			continue
-		}
-
-		for ctrID, epInfo := range netInfo.Containers {
-			if epInfo.EndpointID == "" {
-				continue
-			}
-			if err := p.restoreEndpoint(ctx, n.ID, ctrID, epInfo, opts); err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"network":  n.ID[:12],
-					"endpoint": epInfo.EndpointID[:12],
-					"container": ctrID,
-				}).Error("Restore: failed to restore endpoint")
-				continue
-			}
-			restored++
-		}
+		restored++
 	}
-
-	log.WithField("restored", restored).Info("Restore complete")
+	log.WithFields(log.Fields{
+		"restored": restored,
+		"dropped":  dropped,
+	}).Info("Restore complete")
 	return nil
 }
 
-// restoreEndpoint rehydrates a single endpoint's persistent DHCP client.
-func (p *Plugin) restoreEndpoint(ctx context.Context, networkID, ctrID string, epInfo dNetwork.EndpointResource, opts DHCPNetworkOptions) error {
-	// If a fresh Join has already registered this endpoint while Restore was
-	// running, leave it alone — starting a second udhcpc on the same interface
-	// would create duplicate lease traffic.
+// restoreFromState rebuilds a single dhcpManager from a persisted record.
+func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
+	// If a fresh Join already registered this endpoint, don't double-attach.
 	p.mu.Lock()
-	_, exists := p.persistentDHCP[epInfo.EndpointID]
+	_, exists := p.persistentDHCP[e.EndpointID]
 	p.mu.Unlock()
 	if exists {
 		return nil
 	}
 
-	ctr, err := p.docker.ContainerInspect(ctx, ctrID)
+	// SandboxKey points at the container's netns. After a reboot the tmpfs
+	// entry is gone; that's how we detect "container is gone" without needing
+	// the Docker API.
+	nsHandle, err := netns.GetFromPath(e.SandboxKey)
 	if err != nil {
-		return fmt.Errorf("inspect container: %w", err)
-	}
-	if ctr.State == nil || !ctr.State.Running || ctr.State.Pid == 0 {
-		// Stopped/paused containers don't need a DHCP client; Docker will call
-		// CreateEndpoint/Join again if/when they restart.
-		return nil
-	}
-
-	nsPath := fmt.Sprintf("/proc/%v/ns/net", ctr.State.Pid)
-	nsHandle, err := netns.GetFromPath(nsPath)
-	if err != nil {
-		return fmt.Errorf("open netns: %w", err)
+		return fmt.Errorf("open netns %s: %w", e.SandboxKey, err)
 	}
 	netHandle, err := netlink.NewHandleAt(nsHandle)
 	if err != nil {
 		nsHandle.Close()
 		return fmt.Errorf("open netlink in netns: %w", err)
 	}
-
 	cleanup := func() {
 		netHandle.Delete()
 		nsHandle.Close()
 	}
 
-	ctrLink, ifIndex, err := p.findEndpointLink(netHandle, epInfo, opts)
+	ctrLink, ifIndex, err := findEndpointLinkFromState(netHandle, e)
 	if err != nil {
 		cleanup()
 		return fmt.Errorf("find endpoint interface: %w", err)
@@ -262,7 +271,6 @@ func (p *Plugin) restoreEndpoint(ctx context.Context, networkID, ctrID string, e
 	}
 	var lastV4 *netlink.Addr
 	for i := range v4Addrs {
-		// Pick the first global-scope address; skip link-local.
 		if v4Addrs[i].IP.IsGlobalUnicast() {
 			lastV4 = &v4Addrs[i]
 			break
@@ -270,11 +278,11 @@ func (p *Plugin) restoreEndpoint(ctx context.Context, networkID, ctrID string, e
 	}
 	if lastV4 == nil {
 		cleanup()
-		return fmt.Errorf("no IPv4 address found on interface")
+		return fmt.Errorf("no IPv4 address on interface")
 	}
 
 	var lastV6 *netlink.Addr
-	if opts.IPv6 {
+	if e.IPv6 {
 		v6Addrs, err := netHandle.AddrList(ctrLink, netlinkFamilyV6)
 		if err != nil {
 			cleanup()
@@ -288,21 +296,22 @@ func (p *Plugin) restoreEndpoint(ctx context.Context, networkID, ctrID string, e
 		}
 	}
 
-	hostname := ""
-	if ctr.Config != nil {
-		hostname = ctr.Config.Hostname
+	opts := DHCPNetworkOptions{
+		Bridge: e.Bridge,
+		Mode:   e.Mode,
+		IPv6:   e.IPv6,
 	}
 
 	m := newDHCPManager(p.docker, JoinRequest{
-		NetworkID:  networkID,
-		EndpointID: epInfo.EndpointID,
-		// SandboxKey is not used downstream for restore — udhcpc references the netns via nsPath.
+		NetworkID:  e.NetworkID,
+		EndpointID: e.EndpointID,
+		SandboxKey: e.SandboxKey,
 	}, opts)
 	m.LastIP = lastV4
 	m.LastIPv6 = lastV6
 	m.IfIndex = ifIndex
-	m.nsPath = nsPath
-	m.hostname = hostname
+	m.nsPath = e.SandboxKey
+	m.hostname = e.Hostname
 	m.nsHandle = nsHandle
 	m.netHandle = netHandle
 	m.ctrLink = ctrLink
@@ -313,23 +322,28 @@ func (p *Plugin) restoreEndpoint(ctx context.Context, networkID, ctrID string, e
 	}
 
 	p.mu.Lock()
-	p.persistentDHCP[epInfo.EndpointID] = m
+	p.persistentDHCP[e.EndpointID] = m
 	p.mu.Unlock()
 
 	log.WithFields(log.Fields{
-		"network":  networkID[:12],
-		"endpoint": epInfo.EndpointID[:12],
+		"network":  e.NetworkID[:12],
+		"endpoint": e.EndpointID[:12],
 		"ip":       lastV4.String(),
 	}).Info("Restore: re-attached persistent DHCP client")
 	return nil
 }
 
-// findEndpointLink locates the container-side interface inside the given netns.
-// In bridge mode it uses the host-side veth pair name to find the peer index.
-// In macvlan/ipvlan mode it matches by the endpoint's MAC address.
-func (p *Plugin) findEndpointLink(netHandle *netlink.Handle, epInfo dNetwork.EndpointResource, opts DHCPNetworkOptions) (netlink.Link, int, error) {
-	if opts.NetMode() == NetworkModeBridge {
-		hostName, _ := vethPairNames(epInfo.EndpointID)
+// findEndpointLinkFromState locates the container-side interface inside the
+// given netns using only data from the persisted state record.
+//   - bridge: derive the host-side veth name and follow its peer index.
+//   - macvlan/ipvlan: use the recorded IfIndex (preserved across netns moves).
+func findEndpointLinkFromState(netHandle *netlink.Handle, e endpointState) (netlink.Link, int, error) {
+	mode := e.Mode
+	if mode == "" {
+		mode = NetworkModeBridge
+	}
+	if mode == NetworkModeBridge {
+		hostName, _ := vethPairNames(e.EndpointID)
 		hostLink, err := netlink.LinkByName(hostName)
 		if err != nil {
 			return nil, 0, fmt.Errorf("find host veth %q: %w", hostName, err)
@@ -344,27 +358,20 @@ func (p *Plugin) findEndpointLink(netHandle *netlink.Handle, epInfo dNetwork.End
 		}
 		link, err := netHandle.LinkByIndex(peerIdx)
 		if err != nil {
-			return nil, 0, fmt.Errorf("find peer link by index %d: %w", peerIdx, err)
+			return nil, 0, fmt.Errorf("find peer link by index %d in netns: %w", peerIdx, err)
 		}
 		return link, peerIdx, nil
 	}
 
-	// macvlan/ipvlan: match by MAC. EndpointResource.MacAddress is the address
-	// libnetwork assigned during CreateEndpoint, which we wrote on the interface.
-	wantMAC := epInfo.MacAddress
-	if wantMAC == "" {
-		return nil, 0, fmt.Errorf("endpoint has no MAC address recorded")
+	// macvlan/ipvlan
+	if e.IfIndex == 0 {
+		return nil, 0, fmt.Errorf("no interface index recorded for %s endpoint", mode)
 	}
-	links, err := netHandle.LinkList()
+	link, err := netHandle.LinkByIndex(e.IfIndex)
 	if err != nil {
-		return nil, 0, fmt.Errorf("list links in netns: %w", err)
+		return nil, 0, fmt.Errorf("find link by index %d in netns: %w", e.IfIndex, err)
 	}
-	for _, l := range links {
-		if l.Attrs().HardwareAddr.String() == wantMAC {
-			return l, l.Attrs().Index, nil
-		}
-	}
-	return nil, 0, fmt.Errorf("no interface with MAC %s", wantMAC)
+	return link, e.IfIndex, nil
 }
 
 // netlinkFamilyV4/V6 are the address family constants used by netlink.AddrList.
