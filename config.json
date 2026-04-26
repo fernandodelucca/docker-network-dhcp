@@ -36,7 +36,8 @@
             "destination": "/run/docker.sock",
             "type": "bind",
             "options": [
-                "bind"
+                "bind",
+                "ro"
             ]
         },
         {
@@ -45,13 +46,14 @@
             "type": "bind",
             "options": [
                 "bind",
-                "rshared"
+                "rbind"
             ]
         }
     ],
     "linux": {
         "capabilities": [
             "CAP_NET_ADMIN",
+            "CAP_NET_RAW",
             "CAP_SYS_ADMIN",
             "CAP_SYS_PTRACE"
         ]

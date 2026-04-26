@@ -41,6 +41,14 @@ func IsDHCPPlugin(driver string) bool {
 	return driverRegexp.MatchString(driver)
 }
 
+// shortID returns the first 12 characters of an ID string, safe for IDs shorter than 12 chars
+func shortID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
+
 // DHCPNetworkOptions contains options for the DHCP network driver
 type DHCPNetworkOptions struct {
 	Bridge          string
@@ -190,10 +198,15 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 // Join — connectivity right now matters more than a clean restart later.
 func (p *Plugin) addStateEntry(e endpointState) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.state[e.EndpointID] = e
-	if err := saveStateLocked(p.state); err != nil {
-		log.WithError(err).WithField("endpoint", e.EndpointID[:12]).
+	snapshot := make(map[string]endpointState, len(p.state))
+	for k, v := range p.state {
+		snapshot[k] = v
+	}
+	p.mu.Unlock()
+
+	if err := saveState(snapshot); err != nil {
+		log.WithError(err).WithField("endpoint", shortID(e.EndpointID)).
 			Warn("Failed to persist endpoint state")
 	}
 }
@@ -202,13 +215,19 @@ func (p *Plugin) addStateEntry(e endpointState) {
 // policy as addStateEntry.
 func (p *Plugin) removeStateEntry(endpointID string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if _, ok := p.state[endpointID]; !ok {
+		p.mu.Unlock()
 		return
 	}
 	delete(p.state, endpointID)
-	if err := saveStateLocked(p.state); err != nil {
-		log.WithError(err).WithField("endpoint", endpointID[:12]).
+	snapshot := make(map[string]endpointState, len(p.state))
+	for k, v := range p.state {
+		snapshot[k] = v
+	}
+	p.mu.Unlock()
+
+	if err := saveState(snapshot); err != nil {
+		log.WithError(err).WithField("endpoint", shortID(endpointID)).
 			Warn("Failed to update persisted state on remove")
 	}
 }
@@ -346,7 +365,21 @@ func (p *Plugin) restoreFromState(ctx context.Context, e endpointState) error {
 		return fmt.Errorf("start clients: %w", err)
 	}
 
+	// Re-check under lock to detect concurrent Join or Leave. If Join won the race,
+	// we stop our restored manager and return nil (Join's manager is already active).
+	// If Leave marked the endpoint during restore, we stop the manager and return error.
 	p.mu.Lock()
+	if _, exists := p.persistentDHCP[e.EndpointID]; exists {
+		p.mu.Unlock()
+		_ = m.Stop() // Join concurrent arrived first; discard our restored manager
+		return nil
+	}
+	if _, left := p.leftEndpoints[e.EndpointID]; left {
+		delete(p.leftEndpoints, e.EndpointID)
+		p.mu.Unlock()
+		_ = m.Stop()
+		return fmt.Errorf("endpoint was left during restore")
+	}
 	p.persistentDHCP[e.EndpointID] = m
 	p.mu.Unlock()
 
@@ -380,6 +413,9 @@ func findEndpointLinkFromState(netHandle *netlink.Handle, e endpointState) (netl
 		peerIdx, err := netlink.VethPeerIndex(hostVeth)
 		if err != nil {
 			return nil, 0, fmt.Errorf("get veth peer index: %w", err)
+		}
+		if peerIdx == 0 {
+			return nil, 0, fmt.Errorf("veth peer index is 0 — peer may be destroyed")
 		}
 		link, err := netHandle.LinkByIndex(peerIdx)
 		if err != nil {

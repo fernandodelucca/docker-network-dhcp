@@ -61,9 +61,9 @@ func loadState() (map[string]endpointState, error) {
 	return out, nil
 }
 
-// saveStateLocked writes the endpoint table to disk atomically (temp + rename).
-// Caller must hold Plugin.mu so the snapshot is consistent.
-func saveStateLocked(entries map[string]endpointState) error {
+// saveState writes the endpoint table to disk atomically (temp + rename).
+// The snapshot should be consistent at the call site before passing.
+func saveState(entries map[string]endpointState) error {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
 	}

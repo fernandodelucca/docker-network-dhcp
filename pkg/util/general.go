@@ -6,9 +6,13 @@ import (
 )
 
 func AwaitCondition(ctx context.Context, cond func() (bool, error), interval time.Duration) error {
-	errChan := make(chan error)
+	errChan := make(chan error, 1)
 	go func() {
 		for {
+			if ctx.Err() != nil {
+				errChan <- ctx.Err()
+				return
+			}
 			ok, err := cond()
 			if err != nil {
 				errChan <- err
@@ -20,7 +24,12 @@ func AwaitCondition(ctx context.Context, cond func() (bool, error), interval tim
 				return
 			}
 
-			time.Sleep(interval)
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			case <-time.After(interval):
+			}
 		}
 	}()
 

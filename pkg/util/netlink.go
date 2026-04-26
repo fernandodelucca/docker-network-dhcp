@@ -11,9 +11,12 @@ import (
 
 func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns.NsHandle, error) {
 	var err error
-	nsChan := make(chan netns.NsHandle)
+	nsChan := make(chan netns.NsHandle, 1)
 	go func() {
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			var ns netns.NsHandle
 			ns, err = netns.GetFromPath(path)
 			if err == nil {
@@ -21,7 +24,11 @@ func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns
 				return
 			}
 
-			time.Sleep(interval)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
 		}
 	}()
 
@@ -39,9 +46,12 @@ func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns
 
 func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, interval time.Duration) (netlink.Link, error) {
 	var err error
-	linkChan := make(chan netlink.Link)
+	linkChan := make(chan netlink.Link, 1)
 	go func() {
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			var link netlink.Link
 			link, err = handle.LinkByIndex(index)
 			if err == nil {
@@ -49,7 +59,11 @@ func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, in
 				return
 			}
 
-			time.Sleep(interval)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
 		}
 	}()
 

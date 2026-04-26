@@ -1,4 +1,4 @@
-FROM golang:alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /usr/local/src/docker-net-dhcp
 COPY go.* ./
@@ -10,7 +10,7 @@ COPY pkg/ ./pkg/
 RUN mkdir bin/ && go build -o bin/ ./cmd/...
 
 
-FROM alpine:latest
+FROM alpine:3.21
 
 RUN mkdir -p /run/docker/plugins /var/lib/net-dhcp
 
