@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -20,8 +22,56 @@ import (
 var (
 	logLevel = flag.String("log", "", "log level")
 	logFile  = flag.String("logfile", "", "log file")
-	bindSock = flag.String("sock", "/run/docker/plugins/net-dhcp.sock", "bind unix socket")
+	bindSock = flag.String("sock", "", "bind unix socket (auto-discovered if empty)")
 )
+
+// discoverSocketPath finds the Docker plugin socket directory mounted by Docker daemon.
+// Docker mounts /run/docker/plugins/<PLUGIN_ID>/ inside the plugin container.
+// This function attempts to discover that directory automatically.
+func discoverSocketPath(flagValue string) string {
+	// 1. If explicitly set via flag/env, use that
+	if flagValue != "" {
+		return flagValue
+	}
+
+	// 2. Try environment variable (allows manual override)
+	if envPath := os.Getenv("DOCKER_PLUGIN_SOCKET"); envPath != "" {
+		log.WithField("source", "DOCKER_PLUGIN_SOCKET").Info("Socket path from environment variable")
+		return envPath
+	}
+
+	// 3. Try to auto-discover: Docker mounts /run/docker/plugins/<PLUGIN_ID>/
+	// If running as a Docker plugin, there should be exactly one mounted directory there
+	pluginsDir := "/run/docker/plugins"
+	if info, err := os.Stat(pluginsDir); err == nil && info.IsDir() {
+		entries, err := ioutil.ReadDir(pluginsDir)
+		if err == nil {
+			// Count subdirectories (plugin IDs)
+			var pluginDirs []string
+			for _, entry := range entries {
+				if entry.IsDir() {
+					pluginDirs = append(pluginDirs, entry.Name())
+				}
+			}
+
+			if len(pluginDirs) == 1 {
+				socketPath := filepath.Join(pluginsDir, pluginDirs[0], "net-dhcp.sock")
+				log.WithField("auto_discovered", socketPath).Info("Auto-discovered socket path")
+				return socketPath
+			} else if len(pluginDirs) > 1 {
+				log.WithFields(log.Fields{
+					"plugin_dirs": pluginDirs,
+					"count":       len(pluginDirs),
+				}).Warn("Multiple plugin directories found, cannot auto-discover — will use fallback")
+			}
+		}
+	}
+
+	// 4. Fallback: use default path (for development/testing)
+	defaultPath := "/run/docker/plugins/net-dhcp.sock"
+	log.WithField("fallback", defaultPath).Info("Using fallback socket path")
+	return defaultPath
+}
 
 // waitForDockerReady blocks until dockerd is ready to accept API calls, with 500ms retry intervals up to 30 seconds
 func waitForDockerReady(ctx context.Context, client *docker.Client) error {
@@ -47,6 +97,9 @@ func waitForDockerReady(ctx context.Context, client *docker.Client) error {
 func main() {
 	flag.Parse()
 
+	// Discover socket path: explicit flag > environment variable > auto-discovery > fallback
+	actualSocketPath := discoverSocketPath(*bindSock)
+
 	if *logLevel == "" {
 		if *logLevel = os.Getenv("LOG_LEVEL"); *logLevel == "" {
 			*logLevel = "info"
@@ -71,7 +124,7 @@ func main() {
 
 	log.WithFields(log.Fields{
 		"log_level": *logLevel,
-		"socket":    *bindSock,
+		"socket":    actualSocketPath,
 		"logfile":   *logFile,
 	}).Info("Plugin starting up")
 
@@ -117,7 +170,7 @@ func main() {
 		log.Info("Starting server...")
 		// http.ErrServerClosed is the expected return when Close() is called
 		// during graceful shutdown — don't escalate that to Fatal.
-		if err := p.Listen(*bindSock); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := p.Listen(actualSocketPath); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.WithError(err).Fatal("Failed to start plugin")
 		}
 		log.Info("HTTP server stopped")
@@ -126,9 +179,9 @@ func main() {
 	// Verify socket is created and accessible
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		if info, err := os.Stat(*bindSock); err == nil {
+		if info, err := os.Stat(actualSocketPath); err == nil {
 			log.WithFields(log.Fields{
-				"socket":    *bindSock,
+				"socket":    actualSocketPath,
 				"mode":      fmt.Sprintf("%#o", info.Mode()),
 				"size":      info.Size(),
 			}).Info("Plugin socket created and accessible")

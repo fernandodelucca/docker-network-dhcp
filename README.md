@@ -24,6 +24,17 @@ A Docker network driver plugin that allocates IP addresses via DHCP to container
 - **Linux Kernel**: netlink and network namespace support (standard on modern Linux)
 - **Privileges**: Plugin requires CAP_NET_ADMIN and CAP_SYS_ADMIN capabilities
 
+## Socket Configuration
+
+The plugin automatically discovers the correct Unix socket path to bind to. See [SOCKET_DISCOVERY.md](SOCKET_DISCOVERY.md) for detailed information on:
+
+- How the plugin discovers its socket path
+- Why auto-discovery is needed
+- How to override socket path if needed
+- Deployment scenarios and troubleshooting
+
+**TL;DR**: When installed via Docker plugin manager, the socket path is auto-discovered. No manual configuration needed.
+
 ## Installation
 
 ### From Docker Registry
