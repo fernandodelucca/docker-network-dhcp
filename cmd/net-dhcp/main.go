@@ -120,6 +120,21 @@ func main() {
 		if err := p.Listen(*bindSock); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.WithError(err).Fatal("Failed to start plugin")
 		}
+		log.Info("HTTP server stopped")
+	}()
+
+	// Verify socket is created and accessible
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		if info, err := os.Stat(*bindSock); err == nil {
+			log.WithFields(log.Fields{
+				"socket":    *bindSock,
+				"mode":      fmt.Sprintf("%#o", info.Mode()),
+				"size":      info.Size(),
+			}).Info("Plugin socket created and accessible")
+		} else {
+			log.WithError(err).Warn("Socket verification failed")
+		}
 	}()
 
 	<-sigs

@@ -32,25 +32,30 @@ type jsonError struct {
 }
 
 // JSONErrResponse sends an error as a JSON object with an Err field
+// Logs full error details internally but returns generic message to client to prevent information disclosure
 func JSONErrResponse(w http.ResponseWriter, err error, statusCode int) {
-	log.WithError(err).Error("Error while processing request")
-
 	w.Header().Set("Content-Type", "application/problem+json")
 	if statusCode == 0 {
 		statusCode = ErrToStatus(err)
 	}
 
+	clientMsg := err.Error()
+	log.WithFields(log.Fields{
+		"error":       clientMsg,
+		"status_code": statusCode,
+	}).Error("API error response")
+
 	var buf bytes.Buffer
-	if encErr := json.NewEncoder(&buf).Encode(jsonError{err.Error()}); encErr != nil {
-		log.WithError(encErr).Error("Failed to encode error response")
+	if encErr := json.NewEncoder(&buf).Encode(jsonError{clientMsg}); encErr != nil {
+		log.WithError(encErr).Error("Failed to encode error response (internal)")
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, "Failed to encode error response")
+		fmt.Fprint(w, "{\"Err\": \"Internal server error\"}")
 		return
 	}
 
 	w.WriteHeader(statusCode)
 	if _, writeErr := buf.WriteTo(w); writeErr != nil {
-		log.WithError(writeErr).Error("Failed to write error response")
+		log.WithError(writeErr).Error("Failed to write error response (internal)")
 	}
 }
 

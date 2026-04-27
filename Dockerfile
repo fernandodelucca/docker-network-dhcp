@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.2-alpine AS builder
 
 WORKDIR /usr/local/src/docker-net-dhcp
 COPY go.* ./
