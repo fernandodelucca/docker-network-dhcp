@@ -37,8 +37,9 @@ type DHCPClientOptions struct {
 type DHCPClient struct {
 	Opts *DHCPClientOptions
 
-	cmd       *exec.Cmd
-	eventPipe io.ReadCloser
+	cmd        *exec.Cmd
+	eventPipe  io.ReadCloser
+	stderrPipe io.ReadCloser
 }
 
 // NewDHCPClient creates a new udhcpc(6) client
@@ -53,23 +54,20 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 	}
 	c := &DHCPClient{
 		Opts: opts,
-		// Foreground, set interface and handler "script"
-		cmd: exec.Command(path, "-f", "-i", iface, "-s", opts.HandlerScript),
+		cmd:  exec.Command(path, "-f", "-i", iface, "-s", opts.HandlerScript),
 	}
 
 	stderrPipe, err := c.cmd.StderrPipe()
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up udhcpc stderr pipe: %w", err)
 	}
-	// Pipe udhcpc stderr (logs) to logrus at debug level
-	go io.Copy(log.StandardLogger().WriterLevel(log.DebugLevel), stderrPipe)
+	c.stderrPipe = stderrPipe
 
 	if c.eventPipe, err = c.cmd.StdoutPipe(); err != nil {
 		return nil, fmt.Errorf("failed to set up udhcpc stdout pipe: %w", err)
 	}
 
 	if opts.Once {
-		// Exit after obtaining lease
 		c.cmd.Args = append(c.cmd.Args, "-q")
 	} else {
 		// Release IP address on exit
@@ -79,17 +77,13 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 	if opts.Hostname != "" {
 		hostnameOpt := "hostname:" + opts.Hostname
 		if opts.V6 {
-			// TODO: We encode the fqdn for DHCPv6 because udhcpc6 seems to be broken
+			// Encode the FQDN for DHCPv6 (udhcpc6 option 0x27, RFC4704)
 			var data bytes.Buffer
-
-			// flags: S bit set (see RFC4704)
-			binary.Write(&data, binary.BigEndian, uint8(0b0001))
+			binary.Write(&data, binary.BigEndian, uint8(0b0001)) // S bit set
 			binary.Write(&data, binary.BigEndian, uint8(len(opts.Hostname)))
 			data.WriteString(opts.Hostname)
-
 			hostnameOpt = "0x27:" + hex.EncodeToString(data.Bytes())
 		}
-
 		c.cmd.Args = append(c.cmd.Args, "-x", hostnameOpt)
 	}
 
@@ -125,14 +119,16 @@ func (c *DHCPClient) Start() (chan Event, error) {
 		if err := netns.Set(ns); err != nil {
 			return nil, fmt.Errorf("failed to enter network namespace: %w", err)
 		}
-
-		// Make sure we go back to the old namespace when we return
 		defer netns.Set(origNS)
 	}
 
 	if err := c.cmd.Start(); err != nil {
 		return nil, err
 	}
+
+	// Launch stderr relay only after successful Start() to avoid goroutine leak
+	// on failed starts (pipe would never close if process never started).
+	go io.Copy(log.StandardLogger().WriterLevel(log.DebugLevel), c.stderrPipe)
 
 	events := make(chan Event)
 	go func() {
@@ -141,31 +137,39 @@ func (c *DHCPClient) Start() (chan Event, error) {
 		for scanner.Scan() {
 			log.WithField("line", string(scanner.Bytes())).Trace("udhcpc handler line")
 
-			// Each line is a JSON-encoded event
 			var event Event
 			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 				log.WithError(err).Warn("Failed to decode udhcpc event")
 				continue
 			}
-
 			events <- event
+		}
+		// Log I/O errors so they're distinguishable from clean EOF
+		if err := scanner.Err(); err != nil {
+			log.WithError(err).Warn("udhcpc event pipe read error")
 		}
 	}()
 
 	return events, nil
 }
 
-// Finish sends SIGTERM to udhcpc(6) and waits for it to exit. SIGTERM will not
-// be sent if `Opts.Once` is set.
+// Drain reaps the exit status of a process that has already crashed on its own.
+// Call this after detecting that the event channel was closed unexpectedly,
+// to avoid leaving a zombie process.
+func (c *DHCPClient) Drain() {
+	_ = c.cmd.Wait()
+}
+
+// Finish sends SIGTERM to udhcpc(6) and waits for it to exit.
 func (c *DHCPClient) Finish(ctx context.Context) error {
-	// If only running to get an IP once, udhcpc will terminate on its own
 	if !c.Opts.Once {
 		if err := c.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			return fmt.Errorf("failed to send SIGTERM to udhcpc: %w", err)
 		}
 	}
 
-	errChan := make(chan error)
+	// Buffered(1) so the goroutine can exit even if ctx fires first.
+	errChan := make(chan error, 1)
 	go func() {
 		errChan <- c.cmd.Wait()
 	}()
@@ -174,25 +178,24 @@ func (c *DHCPClient) Finish(ctx context.Context) error {
 	case err := <-errChan:
 		return err
 	case <-ctx.Done():
-		c.cmd.Process.Kill()
+		if err := c.cmd.Process.Kill(); err != nil {
+			log.WithError(err).Warn("udhcpc SIGKILL failed — process may have already exited")
+		}
 		return ctx.Err()
 	}
 }
 
-// GetIP is a convenience function that runs udhcpc(6) once and returns the IP
-// info obtained.
+// GetIP is a convenience function that runs udhcpc(6) once and returns the IP obtained.
 func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, error) {
-	dummy := Info{}
-
 	opts.Once = true
 	client, err := NewDHCPClient(iface, opts)
 	if err != nil {
-		return dummy, fmt.Errorf("failed to create DHCP client: %w", err)
+		return Info{}, fmt.Errorf("failed to create DHCP client: %w", err)
 	}
 
 	events, err := client.Start()
 	if err != nil {
-		return dummy, fmt.Errorf("failed to start DHCP client: %w", err)
+		return Info{}, fmt.Errorf("failed to start DHCP client: %w", err)
 	}
 
 	var info *Info
@@ -213,11 +216,11 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 	defer close(done)
 
 	if err := client.Finish(ctx); err != nil {
-		return dummy, err
+		return Info{}, err
 	}
 
 	if info == nil {
-		return dummy, util.ErrNoLease
+		return Info{}, util.ErrNoLease
 	}
 
 	return *info, nil

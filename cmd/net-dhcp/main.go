@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,40 +19,35 @@ import (
 )
 
 var (
-	logLevel = flag.String("log", "", "log level")
-	logFile  = flag.String("logfile", "", "log file")
+	logLevel = flag.String("log", "", "log level (overrides DOCKER_NETWORK_DHCP_LOG_LEVEL)")
+	logFile  = flag.String("logfile", "", "log file (overrides DOCKER_NETWORK_DHCP_LOGFILE)")
 	bindSock = flag.String("sock", "", "bind unix socket (auto-discovered if empty)")
 )
 
 // discoverSocketPath finds the Docker plugin socket directory mounted by Docker daemon.
 // Docker mounts /run/docker/plugins/<PLUGIN_ID>/ inside the plugin container.
-// This function attempts to discover that directory automatically.
+// Priority: explicit flag > DOCKER_PLUGIN_SOCKET env var > auto-discovery > fallback.
 func discoverSocketPath(flagValue string) string {
-	// 1. If explicitly set via flag/env, use that
 	if flagValue != "" {
 		return flagValue
 	}
 
-	// 2. Try environment variable (allows manual override)
 	if envPath := os.Getenv("DOCKER_PLUGIN_SOCKET"); envPath != "" {
 		log.WithField("source", "DOCKER_PLUGIN_SOCKET").Info("Socket path from environment variable")
 		return envPath
 	}
 
-	// 3. Try to auto-discover: Docker mounts /run/docker/plugins/<PLUGIN_ID>/
-	// If running as a Docker plugin, there should be exactly one mounted directory there
+	// Auto-discover: Docker mounts /run/docker/plugins/<PLUGIN_ID>/ inside the plugin container.
 	pluginsDir := "/run/docker/plugins"
 	if info, err := os.Stat(pluginsDir); err == nil && info.IsDir() {
-		entries, err := ioutil.ReadDir(pluginsDir)
+		entries, err := os.ReadDir(pluginsDir)
 		if err == nil {
-			// Count subdirectories (plugin IDs)
 			var pluginDirs []string
 			for _, entry := range entries {
 				if entry.IsDir() {
 					pluginDirs = append(pluginDirs, entry.Name())
 				}
 			}
-
 			if len(pluginDirs) == 1 {
 				socketPath := filepath.Join(pluginsDir, pluginDirs[0], "net-dhcp.sock")
 				log.WithField("auto_discovered", socketPath).Info("Auto-discovered socket path")
@@ -62,34 +56,31 @@ func discoverSocketPath(flagValue string) string {
 				log.WithFields(log.Fields{
 					"plugin_dirs": pluginDirs,
 					"count":       len(pluginDirs),
-				}).Warn("Multiple plugin directories found, cannot auto-discover — will use fallback")
+				}).Warn("Multiple plugin directories found, cannot auto-discover — using fallback")
 			}
 		}
 	}
 
-	// 4. Fallback: use default path (for development/testing)
 	defaultPath := "/run/docker/plugins/net-dhcp.sock"
 	log.WithField("fallback", defaultPath).Info("Using fallback socket path")
 	return defaultPath
 }
 
-// waitForDockerReady blocks until dockerd is ready to accept API calls, with 500ms retry intervals up to 30 seconds
+// waitForDockerReady blocks until dockerd is ready, retrying every 500ms up to 30 seconds.
 func waitForDockerReady(ctx context.Context, client *docker.Client) error {
 	deadline := time.Now().Add(30 * time.Second)
-	interval := 500 * time.Millisecond
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("docker daemon not ready after 30 seconds")
 		}
-		_, err := client.Ping(ctx, docker.PingOptions{})
-		if err == nil {
+		if _, err := client.Ping(ctx, docker.PingOptions{}); err == nil {
 			log.Debug("Docker daemon is ready")
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(interval):
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
@@ -97,11 +88,11 @@ func waitForDockerReady(ctx context.Context, client *docker.Client) error {
 func main() {
 	flag.Parse()
 
-	// Discover socket path: explicit flag > environment variable > auto-discovery > fallback
 	actualSocketPath := discoverSocketPath(*bindSock)
 
+	// Log level: flag > DOCKER_NETWORK_DHCP_LOG_LEVEL env var > default "info"
 	if *logLevel == "" {
-		if *logLevel = os.Getenv("LOG_LEVEL"); *logLevel == "" {
+		if *logLevel = os.Getenv("DOCKER_NETWORK_DHCP_LOG_LEVEL"); *logLevel == "" {
 			*logLevel = "info"
 		}
 	}
@@ -112,13 +103,16 @@ func main() {
 	}
 	log.SetLevel(level)
 
+	// Log file: flag > DOCKER_NETWORK_DHCP_LOGFILE env var > stderr
+	if *logFile == "" {
+		*logFile = os.Getenv("DOCKER_NETWORK_DHCP_LOGFILE")
+	}
 	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
 			log.WithError(err).Fatal("Failed to open log file for writing")
 		}
 		defer f.Close()
-
 		log.StandardLogger().Out = f
 	}
 
@@ -128,8 +122,9 @@ func main() {
 		"logfile":   *logFile,
 	}).Info("Plugin starting up")
 
+	// Await timeout: DOCKER_NETWORK_DHCP_AWAIT_TIMEOUT env var > default 10s
 	awaitTimeout := 10 * time.Second
-	if t, ok := os.LookupEnv("AWAIT_TIMEOUT"); ok {
+	if t, ok := os.LookupEnv("DOCKER_NETWORK_DHCP_AWAIT_TIMEOUT"); ok {
 		awaitTimeout, err = time.ParseDuration(t)
 		if err != nil {
 			log.WithError(err).Fatal("Failed to parse await timeout")
@@ -142,14 +137,12 @@ func main() {
 		log.WithError(err).Fatal("Failed to create plugin")
 	}
 
-	// Re-attach persistent DHCP clients to containers that survived a daemon
-	// restart. Runs in the background because the plugin starts before dockerd
-	// finishes "Loading containers" — Restore handles its own readiness wait.
-	// The 10s delay and 5-minute timeout are documented in Plugin.StartRestore().
+	// Re-attach persistent DHCP clients to containers that survived a daemon restart.
+	// Runs in the background with a 10s delay (plugin starts before dockerd finishes
+	// "Loading containers"). The 5-minute timeout is documented in Plugin.StartRestore().
 	p.StartRestore()
 
-	// Wait for Docker daemon to be ready before listening for connections.
-	// This ensures dockerd won't see the plugin socket before it can handle requests.
+	// Wait for Docker daemon before opening the plugin socket to avoid races.
 	if err := waitForDockerReady(context.Background(), p.Client()); err != nil {
 		log.WithError(err).Fatal("Docker daemon did not become ready in time")
 	}
@@ -168,25 +161,22 @@ func main() {
 			}
 		}()
 		log.Info("Starting server...")
-		// http.ErrServerClosed is the expected return when Close() is called
-		// during graceful shutdown — don't escalate that to Fatal.
 		if err := p.Listen(actualSocketPath); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.WithError(err).Fatal("Failed to start plugin")
 		}
 		log.Info("HTTP server stopped")
 	}()
 
-	// Verify socket is created and accessible
+	// Verify socket creation after a short delay.
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		if info, err := os.Stat(actualSocketPath); err == nil {
 			log.WithFields(log.Fields{
-				"socket":    actualSocketPath,
-				"mode":      fmt.Sprintf("%#o", info.Mode()),
-				"size":      info.Size(),
+				"socket": actualSocketPath,
+				"mode":   fmt.Sprintf("%#o", info.Mode()),
 			}).Info("Plugin socket created and accessible")
 		} else {
-			log.WithError(err).Warn("Socket verification failed")
+			log.WithError(err).Warn("Socket verification failed — plugin may not be reachable")
 		}
 	}()
 

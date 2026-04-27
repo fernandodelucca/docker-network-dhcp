@@ -14,38 +14,62 @@
   "linux": {
     "capabilities": [
       "CAP_NET_ADMIN",
-      "CAP_SYS_ADMIN",
-      "CAP_SYS_PTRACE"
+      "CAP_NET_RAW",
+      "CAP_SYS_ADMIN"
     ],
     "allowAllDevices": false,
     "allowAllCapabilities": false
   },
   "mounts": [
     {
+      "name": "docker-socket",
+      "description": "Docker daemon API socket (read-only)",
+      "source": "/var/run/docker.sock",
+      "destination": "/var/run/docker.sock",
+      "type": "bind",
+      "options": [
+        "bind",
+        "ro"
+      ],
+      "settable": null
+    },
+    {
+      "name": "state",
+      "description": "Plugin state directory for DHCP endpoint persistence",
       "source": "/var/lib/net-dhcp",
       "destination": "/var/lib/net-dhcp",
       "type": "bind",
       "options": [
         "rbind",
         "rprivate"
-      ]
+      ],
+      "settable": null
     }
   ],
   "env": [
     {
-      "name": "LOG_LEVEL",
-      "description": "Log level (trace, debug, info, warn, error)",
-      "value": "info"
+      "name": "DOCKER_NETWORK_DHCP_LOG_LEVEL",
+      "description": "Log verbosity: trace, debug, info, warn, error",
+      "value": "info",
+      "settable": ["value"]
     },
     {
-      "name": "AWAIT_TIMEOUT",
-      "description": "Container inspection timeout",
-      "value": "10s"
+      "name": "DOCKER_NETWORK_DHCP_AWAIT_TIMEOUT",
+      "description": "Timeout waiting for container and interface readiness (e.g. 10s, 30s)",
+      "value": "10s",
+      "settable": ["value"]
+    },
+    {
+      "name": "DOCKER_NETWORK_DHCP_LOGFILE",
+      "description": "Log file path. Empty = stderr (captured by Docker daemon log)",
+      "value": "",
+      "settable": ["value"]
     },
     {
       "name": "DOCKER_PLUGIN_SOCKET",
       "description": "Override automatic socket path discovery (optional)",
-      "value": ""
+      "value": "",
+      "settable": ["value"]
     }
   ]
 }

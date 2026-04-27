@@ -10,20 +10,18 @@ import (
 )
 
 func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns.NsHandle, error) {
-	var err error
 	nsChan := make(chan netns.NsHandle, 1)
 	go func() {
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			var ns netns.NsHandle
-			ns, err = netns.GetFromPath(path)
+			ns, err := netns.GetFromPath(path)
 			if err == nil {
 				nsChan <- ns
 				return
 			}
-
+			log.WithError(err).WithField("path", path).Trace("Awaiting network namespace")
 			select {
 			case <-ctx.Done():
 				return
@@ -37,28 +35,23 @@ func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns
 	case ns := <-nsChan:
 		return ns, nil
 	case <-ctx.Done():
-		if err != nil {
-			log.WithError(err).WithField("path", path).Error("Failed to await network namespace")
-		}
 		return dummy, ctx.Err()
 	}
 }
 
 func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, interval time.Duration) (netlink.Link, error) {
-	var err error
 	linkChan := make(chan netlink.Link, 1)
 	go func() {
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			var link netlink.Link
-			link, err = handle.LinkByIndex(index)
+			link, err := handle.LinkByIndex(index)
 			if err == nil {
 				linkChan <- link
 				return
 			}
-
+			log.WithError(err).WithField("index", index).Trace("Awaiting link by index")
 			select {
 			case <-ctx.Done():
 				return
@@ -72,9 +65,6 @@ func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, in
 	case link := <-linkChan:
 		return link, nil
 	case <-ctx.Done():
-		if err != nil {
-			log.WithError(err).WithField("index", index).Error("Failed to await link by index")
-		}
 		return dummy, ctx.Err()
 	}
 }

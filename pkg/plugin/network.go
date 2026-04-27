@@ -665,6 +665,19 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		}
 	}
 
+	// Persist a partial state entry immediately — before the goroutine starts —
+	// so a plugin crash between Join HTTP 200 and goroutine completion does not
+	// lose the endpoint. Hostname is not known yet; the goroutine updates it.
+	p.addStateEntry(endpointState{
+		NetworkID:  r.NetworkID,
+		EndpointID: r.EndpointID,
+		SandboxKey: r.SandboxKey,
+		Mode:       opts.NetMode(),
+		Bridge:     opts.Bridge,
+		IPv6:       opts.IPv6,
+		IfIndex:    hint.IfIndex,
+	})
+
 	go func() {
 		defer func() {
 			if recoverPanic := recover(); recoverPanic != nil {
@@ -692,41 +705,29 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		m.IfIndex = hint.IfIndex
 
 		if err := m.Start(ctx); err != nil {
-			log.WithError(err).WithFields(log.Fields{
-				"network":  r.NetworkID[:12],
-				"endpoint": r.EndpointID[:12],
-				"sandbox":  r.SandboxKey,
-			}).Error("Failed to start persistent DHCP client")
+			log.WithError(err).WithFields(logFields).Error("Failed to start persistent DHCP client")
 			return
 		}
 
 		p.mu.Lock()
-		// Check if Leave was called while we were starting
+		// Check if Leave was called while we were starting.
 		if _, left := p.leftEndpoints[r.EndpointID]; left {
 			delete(p.leftEndpoints, r.EndpointID)
 			p.mu.Unlock()
 			_ = m.Stop()
-			log.WithFields(log.Fields{
-				"network":  r.NetworkID[:12],
-				"endpoint": r.EndpointID[:12],
-			}).Debug("Join completed but endpoint was left during startup; cleaned up manager")
+			log.WithFields(logFields).Debug("Join completed but endpoint was left during startup; cleaned up manager")
 			return
 		}
 		p.persistentDHCP[r.EndpointID] = m
 		p.mu.Unlock()
 
-		// Persist enough state to rebuild this manager after a plugin restart
-		// without needing the Docker API to be responsive.
-		p.addStateEntry(endpointState{
-			NetworkID:  r.NetworkID,
-			EndpointID: r.EndpointID,
-			SandboxKey: r.SandboxKey,
-			Mode:       opts.NetMode(),
-			Bridge:     opts.Bridge,
-			IPv6:       opts.IPv6,
-			IfIndex:    hint.IfIndex,
-			Hostname:   m.hostname,
-		})
+		// Update hostname in the persisted entry now that Start() resolved it.
+		if m.hostname != "" {
+			p.updateStateEntry(r.EndpointID, func(e *endpointState) {
+				e.Hostname = m.hostname
+			})
+		}
+		log.WithFields(logFields).WithField("hostname", m.hostname).Debug("Join: DHCP manager registered and state persisted")
 	}()
 
 	duration := time.Since(startTime)
@@ -761,30 +762,27 @@ func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
 	manager, ok := p.persistentDHCP[r.EndpointID]
 	if ok {
 		delete(p.persistentDHCP, r.EndpointID)
-	} else {
-		// Join goroutine may be in-flight — cancel it and mark as left
-		if cancel, pending := p.cancelJoin[r.EndpointID]; pending {
-			cancel()
-			log.WithFields(logFields).Debug("Leave: cancelled in-flight Join goroutine")
+		p.mu.Unlock()
+
+		log.WithFields(logFields).Debug("Leave: stopping persistent DHCP client")
+		if err := manager.Stop(); err != nil {
+			log.WithFields(logFields).WithError(err).Error("Leave: failed to stop DHCP client")
+			return err
 		}
-		p.leftEndpoints[r.EndpointID] = struct{}{}
+		duration := time.Since(startTime)
+		log.WithFields(logFields).WithField("duration_ms", duration.Milliseconds()).Info("Leave: completed successfully")
+		return nil
 	}
+
+	// No active manager: Join goroutine may be in-flight — cancel it and mark as left.
+	if cancel, pending := p.cancelJoin[r.EndpointID]; pending {
+		cancel()
+		delete(p.cancelJoin, r.EndpointID)
+		log.WithFields(logFields).Debug("Leave: cancelled in-flight Join goroutine")
+	}
+	p.leftEndpoints[r.EndpointID] = struct{}{}
 	p.mu.Unlock()
-	if !ok {
-		if manager == nil {
-			log.WithFields(logFields).Warn("Leave called for endpoint without persistent DHCP state — treating as no-op")
-			return nil
-		}
-	}
 
-	log.WithFields(logFields).Debug("Leave: stopping persistent DHCP client")
-	if err := manager.Stop(); err != nil {
-		log.WithFields(logFields).WithError(err).Error("Leave: failed to stop DHCP client")
-		return err
-	}
-
-	duration := time.Since(startTime)
-	log.WithFields(logFields).WithField("duration_ms", duration.Milliseconds()).Info("Leave: completed successfully")
-
+	log.WithFields(logFields).Debug("Leave: no active DHCP manager (Join may still be starting)")
 	return nil
 }

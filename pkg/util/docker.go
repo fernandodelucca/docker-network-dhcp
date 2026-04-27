@@ -13,20 +13,18 @@ const (
 )
 
 func AwaitContainerInspect(ctx context.Context, docker *client.Client, id string, interval time.Duration) (client.ContainerInspectResult, error) {
-	var err error
-	ctrChan := make(chan client.ContainerInspectResult)
+	ctrChan := make(chan client.ContainerInspectResult, 1)
 	go func() {
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			var ctr client.ContainerInspectResult
-			ctr, err = docker.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+			ctr, err := docker.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 			if err == nil {
 				ctrChan <- ctr
 				return
 			}
-
+			log.WithError(err).WithField("id", id).Trace("Awaiting container inspect")
 			select {
 			case <-ctx.Done():
 				return
@@ -40,9 +38,6 @@ func AwaitContainerInspect(ctx context.Context, docker *client.Client, id string
 	case ctr := <-ctrChan:
 		return ctr, nil
 	case <-ctx.Done():
-		if err != nil {
-			log.WithError(err).WithField("id", id).Error("Failed to await container by ID")
-		}
 		return dummy, ctx.Err()
 	}
 }

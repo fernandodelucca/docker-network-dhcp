@@ -115,8 +115,14 @@ type Plugin struct {
 	cancelJoin    map[string]context.CancelFunc
 	leftEndpoints map[string]struct{}
 
-	restoreCancel context.CancelFunc
-	restoreWg     sync.WaitGroup
+	// saveMu serializes disk writes so concurrent addStateEntry/removeStateEntry
+	// calls cannot race on the state file (both take snapshots under mu, but
+	// without saveMu the slower write could overwrite the more recent snapshot).
+	saveMu sync.Mutex
+
+	restoreCancel    context.CancelFunc
+	restoreWg        sync.WaitGroup
+	restoreComplete  bool
 }
 
 // NewPlugin creates a new Plugin
@@ -184,6 +190,8 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	mux.HandleFunc("/NetworkDriver.Join", p.apiJoin)
 	mux.HandleFunc("/NetworkDriver.Leave", p.apiLeave)
 
+	mux.HandleFunc("/healthz", p.apiHealthz)
+
 	// Optional libnetwork driver methods we don't implement. Returning 200
 	// with {} (instead of letting ServeMux 404 the path) keeps dockerd from
 	// logging trace-level "method not supported" lines for every endpoint.
@@ -215,37 +223,76 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 func (p *Plugin) addStateEntry(e endpointState) {
 	p.mu.Lock()
 	p.state[e.EndpointID] = e
-	snapshot := make(map[string]endpointState, len(p.state))
-	for k, v := range p.state {
-		snapshot[k] = v
-	}
+	snapshot := p.copyState()
 	p.mu.Unlock()
 
-	if err := saveState(snapshot); err != nil {
+	p.saveMu.Lock()
+	err := saveState(snapshot)
+	p.saveMu.Unlock()
+
+	if err != nil {
 		log.WithError(err).WithField("endpoint", shortID(e.EndpointID)).
 			Warn("Failed to persist endpoint state")
 	}
 }
 
-// removeStateEntry drops an endpoint record from disk. Same logging-only
-// policy as addStateEntry.
+// updateStateEntry applies an in-place update to an existing entry, then
+// persists. Used by the Join goroutine to add hostname after async resolution.
+func (p *Plugin) updateStateEntry(endpointID string, update func(*endpointState)) {
+	p.mu.Lock()
+	if e, ok := p.state[endpointID]; ok {
+		update(&e)
+		p.state[endpointID] = e
+	}
+	snapshot := p.copyState()
+	p.mu.Unlock()
+
+	p.saveMu.Lock()
+	err := saveState(snapshot)
+	p.saveMu.Unlock()
+
+	if err != nil {
+		log.WithError(err).WithField("endpoint", shortID(endpointID)).
+			Warn("Failed to update persisted state")
+	}
+}
+
+// removeStateEntry drops an endpoint record from disk. Also cleans
+// leftEndpoints to prevent unbounded map growth. Same logging-only policy
+// as addStateEntry.
 func (p *Plugin) removeStateEntry(endpointID string) {
 	p.mu.Lock()
-	if _, ok := p.state[endpointID]; !ok {
-		p.mu.Unlock()
+	_, exists := p.state[endpointID]
+	if exists {
+		delete(p.state, endpointID)
+	}
+	// Always clean leftEndpoints to prevent map from growing indefinitely for
+	// endpoints that had Leave called without an active manager.
+	delete(p.leftEndpoints, endpointID)
+	snapshot := p.copyState()
+	p.mu.Unlock()
+
+	if !exists {
 		return
 	}
-	delete(p.state, endpointID)
+
+	p.saveMu.Lock()
+	err := saveState(snapshot)
+	p.saveMu.Unlock()
+
+	if err != nil {
+		log.WithError(err).WithField("endpoint", shortID(endpointID)).
+			Warn("Failed to update persisted state on remove")
+	}
+}
+
+// copyState returns a shallow copy of p.state. Must be called with p.mu held.
+func (p *Plugin) copyState() map[string]endpointState {
 	snapshot := make(map[string]endpointState, len(p.state))
 	for k, v := range p.state {
 		snapshot[k] = v
 	}
-	p.mu.Unlock()
-
-	if err := saveState(snapshot); err != nil {
-		log.WithError(err).WithField("endpoint", shortID(endpointID)).
-			Warn("Failed to update persisted state on remove")
-	}
+	return snapshot
 }
 
 // Restore re-attaches persistent DHCP clients to endpoints that survived a
@@ -268,6 +315,8 @@ func (p *Plugin) Restore(ctx context.Context) error {
 
 	log.WithField("total_endpoints", len(snapshot)).Info("Restore: starting recovery of persisted endpoints")
 
+	restoreBackoffs := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
 	restored := 0
 	dropped := 0
 	for _, e := range snapshot {
@@ -283,12 +332,34 @@ func (p *Plugin) Restore(ctx context.Context) error {
 			"bridge":   e.Bridge,
 		}).Trace("Restore: attempting to recover endpoint")
 
-		if err := p.restoreFromState(ctx, e); err != nil {
-			log.WithError(err).WithFields(log.Fields{
+		var restoreErr error
+		for attempt := 0; attempt <= len(restoreBackoffs); attempt++ {
+			if attempt > 0 {
+				delay := restoreBackoffs[attempt-1]
+				log.WithFields(log.Fields{
+					"endpoint": shortID(e.EndpointID),
+					"attempt":  attempt,
+					"delay":    delay,
+				}).Debug("Restore: retrying after transient failure")
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					log.WithError(ctx.Err()).Info("Restore: cancelled during retry wait")
+					return ctx.Err()
+				}
+			}
+			restoreErr = p.restoreFromState(ctx, e)
+			if restoreErr == nil {
+				break
+			}
+		}
+
+		if restoreErr != nil {
+			log.WithError(restoreErr).WithFields(log.Fields{
 				"network":  shortID(e.NetworkID),
 				"endpoint": shortID(e.EndpointID),
 				"sandbox":  e.SandboxKey,
-			}).Warn("Restore: dropping endpoint (failed to restore)")
+			}).Warn("Restore: dropping endpoint after retries exhausted")
 			p.removeStateEntry(e.EndpointID)
 			dropped++
 			continue
@@ -463,7 +534,7 @@ func findEndpointLinkFromState(netHandle *netlink.Handle, e endpointState) (netl
 		if !ok {
 			return nil, 0, util.ErrNotVEth
 		}
-		peerIdx, err := vethPeerIndex(hostVeth)
+		peerIdx, err := netlink.VethPeerIndex(hostVeth)
 		if err != nil {
 			return nil, 0, fmt.Errorf("get veth peer index: %w", err)
 		}
@@ -498,33 +569,6 @@ const (
 	netlinkRTPROT_KERNEL = 2  // unix.RTPROT_KERNEL
 )
 
-// vethPeerIndex is a workaround for netlink.VethPeerIndex when it's not available.
-// It reads the peer index from the veth link's attributes.
-func vethPeerIndex(veth *netlink.Veth) (int, error) {
-	// The peer index is typically stored in the link's Alias or we can derive it
-	// from the peer name if available. For now, we'll use the link index +1 as a heuristic
-	// In production code running on Linux, netlink.VethPeerIndex should be available.
-	attrs := veth.Attrs()
-	if attrs.Index == 0 {
-		return 0, fmt.Errorf("veth link index is 0")
-	}
-	// Try to get peer index using netlink operations
-	// This is a simplified fallback - proper implementation should use netlink directly
-	links, err := netlink.LinkList()
-	if err != nil {
-		return 0, fmt.Errorf("failed to list links: %w", err)
-	}
-	for _, link := range links {
-		if v, ok := link.(*netlink.Veth); ok && v.Attrs().Index != attrs.Index {
-			// This is a heuristic - in production we should use proper netlink calls
-			// For veth pairs, often they are created with sequential indices
-			if v.Attrs().Alias == veth.Attrs().Alias || (v.Attrs().Index > attrs.Index && v.Attrs().Index < attrs.Index+2) {
-				return v.Attrs().Index, nil
-			}
-		}
-	}
-	return 0, fmt.Errorf("peer veth not found for index %d", attrs.Index)
-}
 
 // Client returns the Docker client for readiness probing
 func (p *Plugin) Client() *docker.Client {
@@ -566,6 +610,9 @@ func (p *Plugin) StartRestore() {
 		if err := p.Restore(ctx); err != nil {
 			log.WithError(err).Error("Restore phase reported errors")
 		}
+		p.mu.Lock()
+		p.restoreComplete = true
+		p.mu.Unlock()
 	}()
 }
 
@@ -601,4 +648,45 @@ func (p *Plugin) Close() error {
 	}
 
 	return nil
+}
+
+// healthzResponse is the JSON body returned by /healthz.
+type healthzResponse struct {
+	Status          string `json:"status"`
+	DockerConnected bool   `json:"docker_connected"`
+	Endpoints       int    `json:"endpoints"`
+	RestoreComplete bool   `json:"restore_complete"`
+}
+
+// apiHealthz handles GET /healthz. Accessible via the plugin unix socket:
+//
+//	curl --unix-socket /run/docker/plugins/<ID>/net-dhcp.sock http://localhost/healthz
+func (p *Plugin) apiHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+	defer cancel()
+
+	_, pingErr := p.docker.Ping(ctx, docker.PingOptions{})
+	dockerOK := pingErr == nil
+
+	p.mu.Lock()
+	endpoints := len(p.persistentDHCP)
+	restoreComplete := p.restoreComplete
+	p.mu.Unlock()
+
+	status := "ok"
+	if !dockerOK {
+		status = "degraded"
+	}
+
+	code := http.StatusOK
+	if !dockerOK {
+		code = http.StatusServiceUnavailable
+	}
+
+	util.JSONResponse(w, healthzResponse{
+		Status:          status,
+		DockerConnected: dockerOK,
+		Endpoints:       endpoints,
+		RestoreComplete: restoreComplete,
+	}, code)
 }

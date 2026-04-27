@@ -7,7 +7,7 @@ RUN go mod verify
 
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
-RUN mkdir bin/ && go build -o bin/ ./cmd/...
+RUN mkdir bin/ && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/ ./cmd/...
 
 
 FROM alpine:3.21

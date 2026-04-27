@@ -48,27 +48,26 @@ type dhcpManager struct {
 	deconfigured   bool
 	deconfiguredV6 bool
 
-	stopChan   chan struct{}
-	stopOnce   sync.Once
-	started    bool
-	errChan    chan error
-	errChanV6  chan error
+	stopChan  chan struct{}
+	stopOnce  sync.Once
+	started   bool
+	errChan   chan error
+	errChanV6 chan error
 }
 
 func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOptions) *dhcpManager {
 	return &dhcpManager{
-		docker:  docker,
-		joinReq: r,
-		opts:    opts,
-
+		docker:   docker,
+		joinReq:  r,
+		opts:     opts,
 		stopChan: make(chan struct{}),
 	}
 }
 
 func (m *dhcpManager) logFields(v6 bool) log.Fields {
 	return log.Fields{
-		"network":  m.joinReq.NetworkID[:12],
-		"endpoint": m.joinReq.EndpointID[:12],
+		"network":  shortID(m.joinReq.NetworkID),
+		"endpoint": shortID(m.joinReq.EndpointID),
 		"sandbox":  m.joinReq.SandboxKey,
 		"is_ipv6":  v6,
 	}
@@ -204,24 +203,75 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 		return nil, fmt.Errorf("failed to start DHCP%v client: %w", v6Str, err)
 	}
 
+	restartBackoffs := []time.Duration{1 * time.Second, 5 * time.Second, 15 * time.Second}
+
 	errChan := make(chan error, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.WithFields(m.logFields(v6)).WithField("panic", fmt.Sprintf("%v", r)).Error("CRITICAL: setupClient event loop panicked — recovered from panic")
+				log.WithFields(m.logFields(v6)).WithField("panic", fmt.Sprintf("%v", r)).Error("CRITICAL: setupClient event loop panicked")
 				errChan <- fmt.Errorf("setupClient event loop panic: %v", r)
 			}
 		}()
 
+		// activeClient/activeEvents are reassigned on restart; kept local to
+		// this goroutine so there is no shared-state race.
+		activeClient := client
+		activeEvents := events
+
 		for {
 			select {
-			case event, ok := <-events:
+			case event, ok := <-activeEvents:
 				if !ok {
-					log.WithFields(m.logFields(v6)).Error("udhcpc process exited unexpectedly — DHCP renewal lost")
-					errChan <- fmt.Errorf("udhcpc%s process exited unexpectedly", map[bool]string{true: "6"}[v6])
-					return
+					log.WithFields(m.logFields(v6)).Error("udhcpc process exited unexpectedly — attempting restart")
+					activeClient.Drain() // reap zombie before restarting
+
+					restarted := false
+					for attempt, delay := range restartBackoffs {
+						select {
+						case <-time.After(delay):
+						case <-m.stopChan:
+							errChan <- nil
+							return
+						}
+						newClient, err := udhcpc.NewDHCPClient(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{
+							Hostname:  m.hostname,
+							V6:        v6,
+							Namespace: m.nsPath,
+						})
+						if err != nil {
+							log.WithError(err).WithFields(m.logFields(v6)).
+								Errorf("udhcpc restart attempt %d/%d: failed to create client", attempt+1, len(restartBackoffs))
+							continue
+						}
+						newEvents, err := newClient.Start()
+						if err != nil {
+							log.WithError(err).WithFields(m.logFields(v6)).
+								Errorf("udhcpc restart attempt %d/%d: failed to start", attempt+1, len(restartBackoffs))
+							continue
+						}
+						activeClient = newClient
+						activeEvents = newEvents
+						// Reset lease state — new process must rediscover from scratch.
+						if v6 {
+							m.primedV6 = false
+							m.deconfiguredV6 = false
+						} else {
+							m.primed = false
+							m.deconfigured = false
+						}
+						restarted = true
+						log.WithFields(m.logFields(v6)).Infof("udhcpc restarted successfully (attempt %d/%d)", attempt+1, len(restartBackoffs))
+						break
+					}
+					if !restarted {
+						log.WithFields(m.logFields(v6)).Error("udhcpc restart exhausted all attempts — DHCP renewal permanently lost")
+						errChan <- fmt.Errorf("udhcpc%s: all restart attempts exhausted", map[bool]string{true: "6"}[v6])
+						return
+					}
+					continue
 				}
-				log.WithFields(m.logFields(v6)).WithField("event_type", event.Type).Trace("udhcpc event received")
+
 				switch event.Type {
 				case "deconfig":
 					// udhcpc always emits deconfig once at startup (before
@@ -299,7 +349,7 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 
-				errChan <- client.Finish(ctx)
+				errChan <- activeClient.Finish(ctx)
 				return
 			}
 		}
@@ -308,63 +358,61 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 	return errChan, nil
 }
 
-func (m *dhcpManager) Start(ctx context.Context) error {
-	startTime := time.Now()
-	log.WithFields(m.logFields(false)).Info("DHCP manager starting")
+// fetchHostname tries to find the container hostname via Docker API.
+// Non-critical: udhcpc works without hostname; failure returns "".
+func (m *dhcpManager) fetchHostname(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
 	var ctrID string
-	log.WithFields(m.logFields(false)).Trace("Awaiting container ID on network")
 	if err := util.AwaitCondition(ctx, func() (bool, error) {
-		dockerNetResult, err := m.docker.NetworkInspect(ctx, m.joinReq.NetworkID, docker.NetworkInspectOptions{})
+		net, err := m.docker.NetworkInspect(ctx, m.joinReq.NetworkID, docker.NetworkInspectOptions{})
 		if err != nil {
-			return false, fmt.Errorf("failed to get Docker network info: %w", err)
+			return false, nil // best-effort, do not fail Start()
 		}
-
-		for id, info := range dockerNetResult.Network.Containers {
+		for id, info := range net.Network.Containers {
 			if info.EndpointID == m.joinReq.EndpointID {
 				ctrID = id
 				break
 			}
 		}
-		if ctrID == "" {
-			return false, util.ErrNoContainer
-		}
-
-		// Seems like Docker makes the container ID just the endpoint until it's ready
-		return !strings.HasPrefix(ctrID, "ep-"), nil
-	}, pollTime); err != nil {
-		return err
+		return ctrID != "" && !strings.HasPrefix(ctrID, "ep-"), nil
+	}, pollTime); err != nil || ctrID == "" {
+		log.WithFields(m.logFields(false)).Debug("fetchHostname: container not ready yet, proceeding without hostname")
+		return ""
 	}
-	log.WithFields(m.logFields(false)).WithField("container_id", ctrID[:12]).Debug("Container ID found on network")
 
-	log.WithFields(m.logFields(false)).Trace("Awaiting container inspection")
 	ctr, err := util.AwaitContainerInspect(ctx, m.docker, ctrID, pollTime)
 	if err != nil {
-		return fmt.Errorf("failed to get Docker container info: %w", err)
+		log.WithFields(m.logFields(false)).Debug("fetchHostname: inspect failed, proceeding without hostname")
+		return ""
 	}
-	log.WithFields(m.logFields(false)).WithField("pid", ctr.Container.State.Pid).Debug("Container PID obtained")
+	return ctr.Container.Config.Hostname
+}
 
-	// Using the "sandbox key" directly causes issues on some platforms
-	m.nsPath = fmt.Sprintf("/proc/%v/ns/net", ctr.Container.State.Pid)
-	m.hostname = ctr.Container.Config.Hostname
-	log.WithFields(m.logFields(false)).WithFields(log.Fields{
-		"ns_path":  m.nsPath,
-		"hostname": m.hostname,
-	}).Trace("Container namespace path and hostname configured")
+func (m *dhcpManager) Start(ctx context.Context) error {
+	startTime := time.Now()
+	log.WithFields(m.logFields(false)).Info("DHCP manager starting")
 
-	log.WithFields(m.logFields(false)).Trace("Awaiting network namespace")
+	// Use SandboxKey directly — the libnetwork standard approach.
+	// This avoids /proc/<PID>/ns/net which requires pidhost and CAP_SYS_PTRACE.
+	m.nsPath = m.joinReq.SandboxKey
+
+	// Fetch hostname best-effort before opening the netns (for udhcpc -x hostname).
+	m.hostname = m.fetchHostname(ctx)
+	log.WithFields(m.logFields(false)).WithField("hostname", m.hostname).Debug("Container hostname resolved")
+
+	var err error
 	m.nsHandle, err = util.AwaitNetNS(ctx, m.nsPath, pollTime)
 	if err != nil {
-		return fmt.Errorf("failed to get sandbox network namespace: %w", err)
+		return fmt.Errorf("failed to await container netns %s: %w", m.nsPath, err)
 	}
-	log.WithFields(m.logFields(false)).Debug("Network namespace opened")
 
 	m.netHandle, err = netlink.NewHandleAt(m.nsHandle)
 	if err != nil {
 		m.nsHandle.Close()
 		return fmt.Errorf("failed to open netlink handle in sandbox namespace: %w", err)
 	}
-	log.WithFields(m.logFields(false)).Debug("Netlink handle opened")
 
 	if err := func() error {
 		var ctrIndex int
@@ -381,9 +429,12 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 				return util.ErrNotVEth
 			}
 
-			ctrIndex, err = vethPeerIndex(hostVeth)
+			ctrIndex, err = netlink.VethPeerIndex(hostVeth)
 			if err != nil {
 				return fmt.Errorf("failed to get container side of veth's index: %w", err)
+			}
+			if ctrIndex == 0 {
+				return fmt.Errorf("veth peer index is 0 — peer may be destroyed")
 			}
 			oldCtrName = vethCtrName
 		} else {
@@ -399,7 +450,6 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 			if err != nil {
 				return false, fmt.Errorf("failed to get link for container interface: %w", err)
 			}
-
 			return m.ctrLink.Attrs().Name != oldCtrName, nil
 		}, pollTime); err != nil {
 			return err
@@ -413,7 +463,7 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 	}
 
 	duration := time.Since(startTime)
-	log.WithFields(m.logFields(false)).WithField("duration_ms", duration.Milliseconds()).Info("DHCP manager started successfully with persistent clients")
+	log.WithFields(m.logFields(false)).WithField("duration_ms", duration.Milliseconds()).Info("DHCP manager started successfully")
 	return nil
 }
 
@@ -453,32 +503,22 @@ func (m *dhcpManager) RestoreClient(ctx context.Context) error {
 
 func (m *dhcpManager) Stop() error {
 	if !m.started {
-		log.WithFields(m.logFields(false)).Debug("Stop: manager not started, skipping")
 		return nil
 	}
-
-	startTime := time.Now()
-	log.WithFields(m.logFields(false)).Info("Stopping persistent DHCP clients")
 
 	defer m.nsHandle.Close()
 	defer m.netHandle.Delete()
 
 	m.closeStopChan()
-	log.WithFields(m.logFields(false)).Trace("Stop: signaled clients to shutdown")
 
 	if err := <-m.errChan; err != nil {
-		log.WithFields(m.logFields(false)).WithError(err).Warn("DHCPv4 client shutdown reported error")
 		return fmt.Errorf("failed shut down DHCP client: %w", err)
 	}
 	if m.opts.IPv6 {
 		if err := <-m.errChanV6; err != nil {
-			log.WithFields(m.logFields(true)).WithError(err).Warn("DHCPv6 client shutdown reported error")
 			return fmt.Errorf("failed shut down DHCPv6 client: %w", err)
 		}
 	}
-
-	duration := time.Since(startTime)
-	log.WithFields(m.logFields(false)).WithField("duration_ms", duration.Milliseconds()).Info("Persistent DHCP clients stopped")
 
 	return nil
 }
