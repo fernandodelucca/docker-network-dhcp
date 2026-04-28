@@ -122,6 +122,15 @@ func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 		}
 	}
 
+	// Persist network options so netOptions() can answer Join without Docker API
+	// during the next boot (before dockerd is responsive).
+	p.addNetwork(networkState{
+		NetworkID: r.NetworkID,
+		Bridge:    opts.Bridge,
+		Mode:      opts.NetMode(),
+		IPv6:      opts.IPv6,
+	})
+
 	log.WithFields(log.Fields{
 		"network": r.NetworkID,
 		"bridge":  opts.Bridge,
@@ -134,6 +143,7 @@ func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 
 // DeleteNetwork "deletes" a DHCP network (does nothing, the bridge is managed by the user)
 func (p *Plugin) DeleteNetwork(r DeleteNetworkRequest) error {
+	p.removeNetwork(r.NetworkID)
 	log.WithField("network", r.NetworkID).Info("Network deleted")
 	return nil
 }
@@ -142,32 +152,55 @@ func vethPairNames(id string) (string, string) {
 	return "dh-" + id[:12], id[:12] + "-dh"
 }
 
-// netOptions resolves the DHCP network options for a given network. It tries
-// the Docker API first (authoritative) and falls back to persisted endpoint
-// state if the API is unavailable.
+// netOptions resolves the DHCP network options for a given network ID.
 //
-// The fallback is critical during dockerd boot: dockerd may invoke our Join
-// handler before its own API is fully responsive, but it does have a stable
-// libnetwork state for any pre-existing endpoint. By caching the per-network
-// options through the persisted endpoint records (Mode/Bridge/IPv6), we can
-// answer Join even when Docker API is briefly unreachable, allowing containers
-// with restart=always to come back up after a server reboot without manual
-// intervention.
+// Priority 1 — persisted network cache: populated by CreateNetwork and loaded
+// at startup from networks.json. This is the only path that works during
+// dockerd boot, when libnetwork holds its plugin-loading lock and any call
+// back into the Docker API would deadlock.
+//
+// Priority 2 — Docker API: authoritative when responsive. A successful lookup
+// also back-fills the network cache (handles networks created before the cache
+// was introduced). LeaseTimeout/IgnoreConflicts/SkipRoutes come from here only.
+//
+// Priority 3 — persisted endpoint state: last resort if the network was never
+// in the cache and Docker API is unavailable.
 func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions, error) {
-	dummy := DHCPNetworkOptions{}
+	// Priority 1: in-memory network cache (no Docker API, no deadlock risk).
+	p.mu.Lock()
+	if ns, ok := p.networks[id]; ok {
+		p.mu.Unlock()
+		log.WithFields(log.Fields{
+			"network": shortID(id),
+			"bridge":  ns.Bridge,
+			"mode":    ns.Mode,
+		}).Trace("netOptions: served from network cache")
+		return DHCPNetworkOptions{
+			Bridge: ns.Bridge,
+			Mode:   ns.Mode,
+			IPv6:   ns.IPv6,
+		}, nil
+	}
+	p.mu.Unlock()
 
-	nResult, err := p.docker.NetworkInspect(ctx, id, docker.NetworkInspectOptions{})
-	if err == nil {
+	// Priority 2: Docker API (authoritative; may deadlock if called during boot).
+	nResult, apiErr := p.docker.NetworkInspect(ctx, id, docker.NetworkInspectOptions{})
+	if apiErr == nil {
 		opts, decodeErr := decodeOpts(nResult.Network.Options)
 		if decodeErr != nil {
-			return dummy, fmt.Errorf("failed to parse options: %w", decodeErr)
+			return DHCPNetworkOptions{}, fmt.Errorf("failed to parse options: %w", decodeErr)
 		}
+		// Back-fill the cache so future calls (and next boot) skip the Docker API.
+		p.addNetwork(networkState{
+			NetworkID: id,
+			Bridge:    opts.Bridge,
+			Mode:      opts.NetMode(),
+			IPv6:      opts.IPv6,
+		})
 		return opts, nil
 	}
 
-	// Docker API failed. Try to reconstruct from any persisted endpoint that
-	// belongs to this network. Bridge/Mode/IPv6 are persisted per-endpoint and
-	// they are identical for every endpoint in the same network.
+	// Priority 3: any persisted endpoint for this network carries Bridge/Mode/IPv6.
 	p.mu.Lock()
 	var cached *endpointState
 	for _, e := range p.state {
@@ -180,11 +213,11 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 	p.mu.Unlock()
 
 	if cached != nil {
-		log.WithError(err).WithFields(log.Fields{
+		log.WithError(apiErr).WithFields(log.Fields{
 			"network": shortID(id),
 			"bridge":  cached.Bridge,
 			"mode":    cached.Mode,
-		}).Warn("Docker API unavailable for netOptions — using cached state from persisted endpoint")
+		}).Warn("netOptions: Docker API unavailable — using cached state from persisted endpoint")
 		return DHCPNetworkOptions{
 			Bridge: cached.Bridge,
 			Mode:   cached.Mode,
@@ -192,7 +225,7 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 		}, nil
 	}
 
-	return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
+	return DHCPNetworkOptions{}, fmt.Errorf("failed to get network info from Docker: %w", apiErr)
 }
 
 // CreateEndpoint creates the container-side network interface and uses udhcpc to acquire an initial IP address.

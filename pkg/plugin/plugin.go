@@ -114,15 +114,20 @@ type Plugin struct {
 	state         map[string]endpointState
 	cancelJoin    map[string]context.CancelFunc
 	leftEndpoints map[string]struct{}
+	// networks caches per-network driver options (Bridge/Mode/IPv6) keyed by
+	// NetworkID. Populated on CreateNetwork and persisted to networks.json so
+	// that netOptions() can answer Join calls during dockerd boot — before the
+	// Docker API is responsive — without blocking or deadlocking.
+	networks map[string]networkState
 
 	// saveMu serializes disk writes so concurrent addStateEntry/removeStateEntry
 	// calls cannot race on the state file (both take snapshots under mu, but
 	// without saveMu the slower write could overwrite the more recent snapshot).
 	saveMu sync.Mutex
 
-	restoreCancel    context.CancelFunc
-	restoreWg        sync.WaitGroup
-	restoreComplete  bool
+	restoreCancel   context.CancelFunc
+	restoreWg       sync.WaitGroup
+	restoreComplete bool
 }
 
 // NewPlugin creates a new Plugin. CRITICAL: this function MUST NOT block waiting
@@ -157,6 +162,14 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 		log.WithField("persisted_endpoints", len(persisted)).Debug("Loaded persisted endpoint state from disk")
 	}
 
+	nets, err := loadNetworks()
+	if err != nil {
+		log.WithError(err).Warn("Failed to load persisted network state — starting empty")
+		nets = map[string]networkState{}
+	} else {
+		log.WithField("persisted_networks", len(nets)).Debug("Loaded persisted network state from disk")
+	}
+
 	p := Plugin{
 		awaitTimeout: awaitTimeout,
 
@@ -167,6 +180,7 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 		state:          persisted,
 		cancelJoin:     make(map[string]context.CancelFunc),
 		leftEndpoints:  make(map[string]struct{}),
+		networks:       nets,
 	}
 
 	mux := http.NewServeMux()
@@ -282,6 +296,57 @@ func (p *Plugin) removeStateEntry(endpointID string) {
 func (p *Plugin) copyState() map[string]endpointState {
 	snapshot := make(map[string]endpointState, len(p.state))
 	for k, v := range p.state {
+		snapshot[k] = v
+	}
+	return snapshot
+}
+
+// addNetwork persists network driver options so netOptions() can answer Join
+// requests without the Docker API during dockerd boot.
+func (p *Plugin) addNetwork(ns networkState) {
+	p.mu.Lock()
+	p.networks[ns.NetworkID] = ns
+	snapshot := p.copyNetworks()
+	p.mu.Unlock()
+
+	p.saveMu.Lock()
+	err := saveNetworks(snapshot)
+	p.saveMu.Unlock()
+
+	if err != nil {
+		log.WithError(err).WithField("network", shortID(ns.NetworkID)).
+			Warn("Failed to persist network state")
+	}
+}
+
+// removeNetwork drops a network record from the networks cache.
+func (p *Plugin) removeNetwork(networkID string) {
+	p.mu.Lock()
+	_, exists := p.networks[networkID]
+	if exists {
+		delete(p.networks, networkID)
+	}
+	snapshot := p.copyNetworks()
+	p.mu.Unlock()
+
+	if !exists {
+		return
+	}
+
+	p.saveMu.Lock()
+	err := saveNetworks(snapshot)
+	p.saveMu.Unlock()
+
+	if err != nil {
+		log.WithError(err).WithField("network", shortID(networkID)).
+			Warn("Failed to update persisted network state on remove")
+	}
+}
+
+// copyNetworks returns a shallow copy of p.networks. Must be called with p.mu held.
+func (p *Plugin) copyNetworks() map[string]networkState {
+	snapshot := make(map[string]networkState, len(p.networks))
+	for k, v := range p.networks {
 		snapshot[k] = v
 	}
 	return snapshot

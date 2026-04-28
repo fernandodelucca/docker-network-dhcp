@@ -23,13 +23,12 @@
   "mounts": [
     {
       "name": "docker-socket",
-      "description": "Docker daemon API socket (read-only)",
+      "description": "Docker daemon API socket. Read-write because Unix domain sockets require bidirectional access for the client/daemon protocol.",
       "source": "/var/run/docker.sock",
       "destination": "/var/run/docker.sock",
       "type": "bind",
       "options": [
-        "bind",
-        "ro"
+        "bind"
       ],
       "settable": null
     },
@@ -61,7 +60,7 @@
     },
     {
       "name": "DOCKER_NETWORK_DHCP_LOGFILE",
-      "description": "Log file path. Empty = stderr (captured by Docker daemon log)",
+      "description": "Log file path. Empty (default) = stderr, captured by 'docker plugin logs'. Set to a path inside a mounted volume only if you need persistent logs separate from Docker's plugin log.",
       "value": "",
       "settable": ["value"]
     },

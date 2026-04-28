@@ -11,6 +11,7 @@ import (
 	"io"
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
@@ -186,6 +187,12 @@ func (c *DHCPClient) Finish(ctx context.Context) error {
 }
 
 // GetIP is a convenience function that runs udhcpc(6) once and returns the IP obtained.
+//
+// Synchronization: the event-collector goroutine writes to `info` while this
+// function reads it after Finish(). We close `done` to signal the goroutine to
+// exit, then Wait() on the WaitGroup so the goroutine's last write to `info`
+// happens-before our read. Without the WaitGroup the read/write would be a
+// data race detectable by `go test -race`.
 func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, error) {
 	opts.Once = true
 	client, err := NewDHCPClient(iface, opts)
@@ -200,10 +207,16 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 
 	var info *Info
 	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
-			case event := <-events:
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
 				switch event.Type {
 				case "bound", "renew":
 					info = &event.Data
@@ -213,15 +226,16 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 			}
 		}
 	}()
-	defer close(done)
 
-	if err := client.Finish(ctx); err != nil {
-		return Info{}, err
+	finishErr := client.Finish(ctx)
+	close(done)
+	wg.Wait()
+
+	if finishErr != nil {
+		return Info{}, finishErr
 	}
-
 	if info == nil {
 		return Info{}, util.ErrNoLease
 	}
-
 	return *info, nil
 }

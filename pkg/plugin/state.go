@@ -13,6 +13,18 @@ import (
 const stateDir = "/var/lib/net-dhcp"
 
 const stateFile = "state.json"
+const networksFile = "networks.json"
+
+// networkState is the persistent record of a DHCP network's driver options.
+// Persisting these separately from endpoint state means netOptions() can answer
+// Join requests during dockerd boot — before Docker API is responsive — without
+// deadlocking against libnetwork's plugin-loading lock.
+type networkState struct {
+	NetworkID string `json:"network_id"`
+	Bridge    string `json:"bridge"`
+	Mode      string `json:"mode"`
+	IPv6      bool   `json:"ipv6"`
+}
 
 // currentSchemaVersion is incremented whenever endpointState gains or loses
 // fields. loadState uses it to detect old files and migrate gracefully.
@@ -40,6 +52,86 @@ type endpointState struct {
 
 func statePath() string {
 	return filepath.Join(stateDir, stateFile)
+}
+
+func networksPath() string {
+	return filepath.Join(stateDir, networksFile)
+}
+
+// loadNetworks reads the persisted network options table from disk. A missing
+// file is not an error (first run, or pre-persistence install).
+func loadNetworks() (map[string]networkState, error) {
+	out := map[string]networkState{}
+	data, err := os.ReadFile(networksPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return nil, fmt.Errorf("read networks file: %w", err)
+	}
+	if len(data) == 0 {
+		return out, nil
+	}
+	var entries []networkState
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("decode networks file: %w", err)
+	}
+	for _, e := range entries {
+		out[e.NetworkID] = e
+	}
+	return out, nil
+}
+
+// saveNetworks writes the network options table to disk atomically.
+func saveNetworks(entries map[string]networkState) error {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+
+	list := make([]networkState, 0, len(entries))
+	for _, e := range entries {
+		list = append(list, e)
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode networks: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(stateDir, "networks-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp networks file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpName)
+	}()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp networks: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp networks: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync temp networks: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp networks: %w", err)
+	}
+
+	if err := os.Rename(tmpName, networksPath()); err != nil {
+		return fmt.Errorf("rename networks file: %w", err)
+	}
+
+	if dir, err := os.Open(stateDir); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+
+	return nil
 }
 
 // loadState reads the persisted endpoint table from disk. A missing file is
