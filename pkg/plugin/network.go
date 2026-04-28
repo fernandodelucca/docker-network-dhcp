@@ -142,20 +142,57 @@ func vethPairNames(id string) (string, string) {
 	return "dh-" + id[:12], id[:12] + "-dh"
 }
 
+// netOptions resolves the DHCP network options for a given network. It tries
+// the Docker API first (authoritative) and falls back to persisted endpoint
+// state if the API is unavailable.
+//
+// The fallback is critical during dockerd boot: dockerd may invoke our Join
+// handler before its own API is fully responsive, but it does have a stable
+// libnetwork state for any pre-existing endpoint. By caching the per-network
+// options through the persisted endpoint records (Mode/Bridge/IPv6), we can
+// answer Join even when Docker API is briefly unreachable, allowing containers
+// with restart=always to come back up after a server reboot without manual
+// intervention.
 func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions, error) {
 	dummy := DHCPNetworkOptions{}
 
 	nResult, err := p.docker.NetworkInspect(ctx, id, docker.NetworkInspectOptions{})
-	if err != nil {
-		return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
+	if err == nil {
+		opts, decodeErr := decodeOpts(nResult.Network.Options)
+		if decodeErr != nil {
+			return dummy, fmt.Errorf("failed to parse options: %w", decodeErr)
+		}
+		return opts, nil
 	}
 
-	opts, err := decodeOpts(nResult.Network.Options)
-	if err != nil {
-		return dummy, fmt.Errorf("failed to parse options: %w", err)
+	// Docker API failed. Try to reconstruct from any persisted endpoint that
+	// belongs to this network. Bridge/Mode/IPv6 are persisted per-endpoint and
+	// they are identical for every endpoint in the same network.
+	p.mu.Lock()
+	var cached *endpointState
+	for _, e := range p.state {
+		if e.NetworkID == id {
+			eCopy := e
+			cached = &eCopy
+			break
+		}
+	}
+	p.mu.Unlock()
+
+	if cached != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"network": shortID(id),
+			"bridge":  cached.Bridge,
+			"mode":    cached.Mode,
+		}).Warn("Docker API unavailable for netOptions — using cached state from persisted endpoint")
+		return DHCPNetworkOptions{
+			Bridge: cached.Bridge,
+			Mode:   cached.Mode,
+			IPv6:   cached.IPv6,
+		}, nil
 	}
 
-	return opts, nil
+	return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
 }
 
 // CreateEndpoint creates the container-side network interface and uses udhcpc to acquire an initial IP address.

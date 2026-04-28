@@ -22,7 +22,7 @@ A Docker network driver plugin that allocates IP addresses via DHCP to container
 - **Go**: 1.26.2+ (only for building from source)
 - **DHCP Server**: Accessible from the network interface (router DHCP, Dnsmasq, ISC DHCP, etc.)
 - **Linux Kernel**: netlink and network namespace support (standard on modern Linux)
-- **Privileges**: Plugin requires CAP_NET_ADMIN and CAP_SYS_ADMIN capabilities
+- **Privileges**: Plugin requires `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_SYS_ADMIN` capabilities
 
 ## Socket Configuration
 
@@ -39,20 +39,19 @@ The plugin automatically discovers the correct Unix socket path to bind to. See 
 
 ### From Docker Registry
 
-The plugin is available as a Docker plugin package:
+The plugin is published to the GitHub Container Registry:
 
 ```bash
-docker plugin install docker-network-dhcp:latest
+docker plugin install ghcr.io/fernandodelucca/docker-network-dhcp:latest
 ```
 
-When prompted for permissions, grant access to network and host PID namespace:
+When prompted for permissions, review and approve:
 
 ```
-Plugin "docker-network-dhcp:latest" is requesting the following privileges:
+Plugin "ghcr.io/fernandodelucca/docker-network-dhcp:latest" is requesting the following privileges:
  - network: [host]
- - host pid namespace: [true]
- - mount: [/var/run/docker.sock]
- - capabilities: [CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE]
+ - mount: [/var/run/docker.sock /var/lib/net-dhcp]
+ - capabilities: [CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN]
 Do you grant the above permissions? [y/N] y
 ```
 
@@ -60,7 +59,7 @@ Verify installation:
 
 ```bash
 docker plugin ls
-# Should show docker-network-dhcp enabled
+# Should show ghcr.io/fernandodelucca/docker-network-dhcp enabled
 ```
 
 ### Building from Source
@@ -71,19 +70,19 @@ Clone the repository and build:
 git clone https://github.com/fernandodelucca/docker-network-dhcp.git
 cd docker-network-dhcp
 
-# Build for Linux
-go build -o bin/ ./cmd/...
+# Build for Linux (static binary, no debug symbols)
+CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o bin/ ./cmd/...
 
-# Run the plugin
+# Run the plugin (development)
 ./bin/net-dhcp --log debug --sock /run/docker/plugins/net-dhcp.sock
 ```
 
 For Docker plugin container deployment:
 
 ```bash
-docker build -t docker-network-dhcp:latest .
-docker plugin create docker-network-dhcp docker-network-dhcp:latest
-docker plugin enable docker-network-dhcp
+docker build -t ghcr.io/fernandodelucca/docker-network-dhcp:rootfs .
+make create    # creates the plugin from the built rootfs
+make enable    # enables the plugin
 ```
 
 ## Network Modes
@@ -239,11 +238,22 @@ docker network create \
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
-| `LOGFILE` | — | Log file path (empty = stdout) |
-| `AWAIT_TIMEOUT` | 10s | Timeout waiting for container namespace preparation |
+All plugin environment variables use the `DOCKER_NETWORK_DHCP_` prefix and are configurable via `docker plugin set`:
+
+| Variable | Default | Settable | Description |
+|----------|---------|----------|-------------|
+| `DOCKER_NETWORK_DHCP_LOG_LEVEL` | `info` | ✅ | Log verbosity: `trace`, `debug`, `info`, `warn`, `error` |
+| `DOCKER_NETWORK_DHCP_AWAIT_TIMEOUT` | `10s` | ✅ | Timeout waiting for container interface readiness (e.g. `10s`, `30s`) |
+| `DOCKER_NETWORK_DHCP_LOGFILE` | _(empty)_ | ✅ | Log file path. Empty = stderr, captured by Docker daemon log |
+| `DOCKER_PLUGIN_SOCKET` | _(auto)_ | ✅ | Override automatic socket path discovery. Usually not needed |
+
+**Changing a setting at runtime** (plugin must be disabled first):
+
+```bash
+docker plugin disable ghcr.io/fernandodelucca/docker-network-dhcp
+docker plugin set ghcr.io/fernandodelucca/docker-network-dhcp DOCKER_NETWORK_DHCP_LOG_LEVEL=debug
+docker plugin enable ghcr.io/fernandodelucca/docker-network-dhcp
+```
 
 ## Usage Examples
 
@@ -408,13 +418,22 @@ docker network create \
 docker plugin ls
 
 # Inspect plugin details
-docker plugin inspect docker-network-dhcp
+docker plugin inspect ghcr.io/fernandodelucca/docker-network-dhcp
 
-# Test socket responsiveness
-./scripts/health-check.sh
+# Health check — returns JSON with live status
+# Replace <PLUGIN_ID> with the ID from 'docker plugin ls'
+curl -s --unix-socket /run/docker/plugins/<PLUGIN_ID>/net-dhcp.sock \
+  http://localhost/healthz | jq .
+# Example response:
+# {
+#   "status": "ok",
+#   "docker_connected": true,
+#   "endpoints": 3,
+#   "restore_complete": true
+# }
 
-# Or manually test
-curl -s --unix-socket /run/docker/plugins/net-dhcp.sock \
+# Test driver capabilities
+curl -s --unix-socket /run/docker/plugins/<PLUGIN_ID>/net-dhcp.sock \
   -X POST http://localhost/NetworkDriver.GetCapabilities \
   -H 'Content-Type: application/json' \
   -d '{}' | jq .
@@ -422,32 +441,45 @@ curl -s --unix-socket /run/docker/plugins/net-dhcp.sock \
 
 ### View Plugin Logs
 
-```bash
-# For plugin running as container
-docker logs <plugin-container-id>
+By default the plugin logs to **stderr**, which Docker captures and makes available via `docker plugin inspect` or the system journal:
 
-# For plugin running on host
+```bash
+# View live plugin logs (via Docker daemon journal)
+journalctl -f CONTAINER_NAME=<plugin-container-id>
+
+# Or check Docker daemon logs (includes plugin stderr)
+journalctl -fu docker.service | grep net-dhcp
+
+# Enable log file output (persists across plugin restarts)
+docker plugin disable ghcr.io/fernandodelucca/docker-network-dhcp
+docker plugin set ghcr.io/fernandodelucca/docker-network-dhcp \
+  DOCKER_NETWORK_DHCP_LOGFILE=/var/log/net-dhcp.log
+docker plugin enable ghcr.io/fernandodelucca/docker-network-dhcp
+
+# Then tail the file from the host
 tail -f /var/lib/docker/plugins/*/rootfs/var/log/net-dhcp.log
 
-# Enable debug logging
-docker plugin set docker-network-dhcp LOG_LEVEL=trace
-docker plugin disable docker-network-dhcp
-docker plugin enable docker-network-dhcp
+# Enable trace verbosity for deep troubleshooting
+docker plugin disable ghcr.io/fernandodelucca/docker-network-dhcp
+docker plugin set ghcr.io/fernandodelucca/docker-network-dhcp \
+  DOCKER_NETWORK_DHCP_LOG_LEVEL=trace
+docker plugin enable ghcr.io/fernandodelucca/docker-network-dhcp
 ```
 
 ### Common Issues
 
 **Plugin shows as disabled**:
 ```bash
-# Check logs first
-docker logs <container> | grep -i error
+# Check plugin health (replace <PLUGIN_ID> with ID from 'docker plugin ls')
+curl -s --unix-socket /run/docker/plugins/<PLUGIN_ID>/net-dhcp.sock \
+  http://localhost/healthz | jq .
+
+# Check logs
+journalctl -fu docker.service | grep net-dhcp
 
 # Restart plugin
-docker plugin disable docker-network-dhcp
-docker plugin enable docker-network-dhcp
-
-# Verify socket is listening
-docker exec <some-container> curl http://172.17.0.1:8080/health 2>/dev/null || echo "Not reachable"
+docker plugin disable ghcr.io/fernandodelucca/docker-network-dhcp
+docker plugin enable ghcr.io/fernandodelucca/docker-network-dhcp
 ```
 
 **Containers not getting IP**:
@@ -560,7 +592,14 @@ Contributions are welcome! Please review [SECURITY.md](SECURITY.md) and ensure:
 
 ## License
 
-[Specify your license here - e.g., Apache 2.0, MIT, GPL v3]
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+
+It is a fork of [docker-net-dhcp](https://github.com/devplayer0/docker-net-dhcp) by **devplayer0**, which is also GPL-3.0.
+
+- Original work © 2021 devplayer0
+- Modifications and additions © 2024–2026 Fernando Delucca
+
+See [LICENSE.md](LICENSE.md) for the full license text.
 
 ## Support
 

@@ -125,33 +125,25 @@ type Plugin struct {
 	restoreComplete  bool
 }
 
-// NewPlugin creates a new Plugin
+// NewPlugin creates a new Plugin. CRITICAL: this function MUST NOT block waiting
+// for the Docker daemon to be ready. dockerd starts plugins early in its boot
+// sequence and watches for the plugin's unix socket to appear. If we block here,
+// dockerd times out waiting for the socket and marks the plugin as failed —
+// after a reboot the plugin will come back DISABLED, breaking every container
+// that depends on this network.
+//
+// The Docker client object created here is lazy: it only connects on first API
+// call. Background readiness monitoring and operation-level retries handle slow
+// dockerd boot transparently.
 func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	// 60s is generous on purpose: during a `dockerd` restart or under post-boot
-	// IO/CPU pressure, the API socket can be slow for tens of seconds. The
-	// original 2s default caused netOptions/Leave/EndpointOperInfo to fail with
-	// "context deadline exceeded" right after restart. 30s wasn't enough either
-	// in some real reboots — bumped to 60s to cover the worst observed lag.
+	// IO/CPU pressure, the API socket can be slow for tens of seconds.
 	client, err := docker.NewClientWithOpts(
 		docker.WithAPIVersionNegotiation(),
 		docker.WithTimeout(60*time.Second),
 		docker.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
-	}
-
-	// Log Docker daemon info including negotiated API version
-	serverInfo, err := client.ServerVersion(context.Background(), docker.ServerVersionOptions{})
-	if err == nil {
-		log.WithFields(log.Fields{
-			"api_version":    serverInfo.APIVersion,
-			"os":             serverInfo.Os,
-			"arch":           serverInfo.Arch,
-			"docker_version": serverInfo.Version,
-			"experimental":   serverInfo.Experimental,
-		}).Info("Connected to Docker daemon with API version negotiation")
-	} else {
-		log.WithError(err).Warn("Failed to fetch Docker daemon info (connection may succeed later)")
 	}
 
 	persisted, err := loadState()

@@ -1,3 +1,12 @@
+### Copyright Notice
+
+Original work Copyright (C) 2021 devplayer0  
+Modified work Copyright (C) 2024–2026 Fernando Delucca
+
+This project is a fork of [docker-net-dhcp](https://github.com/devplayer0/docker-net-dhcp).
+
+---
+
 ### GNU GENERAL PUBLIC LICENSE
 
 Version 3, 29 June 2007
