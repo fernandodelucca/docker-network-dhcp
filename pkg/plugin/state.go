@@ -10,7 +10,10 @@ import (
 // stateDir is the directory where the plugin persists its endpoint state so
 // it can rebuild the in-memory map after a restart. The plugin's config.json
 // must bind-mount the host's /var/lib/net-dhcp here.
-const stateDir = "/var/lib/net-dhcp"
+//
+// Declared as a var (rather than const) so tests can redirect persistence to
+// t.TempDir(). Production code never mutates it.
+var stateDir = "/var/lib/net-dhcp"
 
 const stateFile = "state.json"
 const networksFile = "networks.json"

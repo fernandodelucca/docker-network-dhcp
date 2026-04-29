@@ -4,20 +4,15 @@ on:
   push:
     branches:
       - master
+  pull_request:
   workflow_dispatch:
 
 jobs:
-  docker:
+  test:
+    name: Test (race detector)
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
-      packages: write
-      
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      PLUGIN_NAME: ghcr.io/fernandodelucca/docker-network-dhcp
-      PLATFORMS: linux/amd64,linux/386,linux/arm64,linux/arm/v7
 
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +27,41 @@ jobs:
         run: |
           go vet ./...
           go build ./...
+
+      # The race detector requires CGO. ubuntu-latest already has gcc, so
+      # CGO_ENABLED=1 is sufficient. Run with -count=1 to defeat the test
+      # cache (we want every CI run to actually exercise the code).
+      - name: Run unit tests with race detector
+        run: |
+          CGO_ENABLED=1 go test -race -count=1 -v ./...
+
+  docker:
+    name: Build & push Docker plugin
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      PLUGIN_NAME: ghcr.io/fernandodelucca/docker-network-dhcp
+      PLATFORMS: linux/amd64,linux/386,linux/arm64,linux/arm/v7
+
+    # The image build only runs on master pushes — pull requests stop after the
+    # test job. This keeps PR validation fast while ensuring releases ship with
+    # tests passing.
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

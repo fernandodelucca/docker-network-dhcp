@@ -28,16 +28,22 @@ var (
 // Docker mounts /run/docker/plugins/<PLUGIN_ID>/ inside the plugin container.
 // Priority: explicit flag > DOCKER_PLUGIN_SOCKET env var > auto-discovery > fallback.
 func discoverSocketPath(flagValue string) string {
+	return resolveSocketPath(flagValue, os.Getenv("DOCKER_PLUGIN_SOCKET"), "/run/docker/plugins", "net-dhcp.sock")
+}
+
+// resolveSocketPath is the testable core of discoverSocketPath. Pure inputs,
+// no global state — main() supplies the real /run/docker/plugins; tests pass
+// a t.TempDir().
+func resolveSocketPath(flagValue, envValue, pluginsDir, socketName string) string {
 	if flagValue != "" {
 		return flagValue
 	}
 
-	if envPath := os.Getenv("DOCKER_PLUGIN_SOCKET"); envPath != "" {
+	if envValue != "" {
 		log.WithField("source", "DOCKER_PLUGIN_SOCKET").Info("Socket path from environment variable")
-		return envPath
+		return envValue
 	}
 
-	pluginsDir := "/run/docker/plugins"
 	if info, err := os.Stat(pluginsDir); err == nil && info.IsDir() {
 		entries, err := os.ReadDir(pluginsDir)
 		if err == nil {
@@ -48,7 +54,7 @@ func discoverSocketPath(flagValue string) string {
 				}
 			}
 			if len(pluginDirs) == 1 {
-				socketPath := filepath.Join(pluginsDir, pluginDirs[0], "net-dhcp.sock")
+				socketPath := filepath.Join(pluginsDir, pluginDirs[0], socketName)
 				log.WithField("auto_discovered", socketPath).Info("Auto-discovered socket path")
 				return socketPath
 			} else if len(pluginDirs) > 1 {
@@ -60,7 +66,7 @@ func discoverSocketPath(flagValue string) string {
 		}
 	}
 
-	defaultPath := "/run/docker/plugins/net-dhcp.sock"
+	defaultPath := filepath.Join(pluginsDir, socketName)
 	log.WithField("fallback", defaultPath).Info("Using fallback socket path")
 	return defaultPath
 }
